@@ -1,0 +1,5 @@
+SCANNER_FOREX_PAIRS = EUR/USD, GBP/USD only
+NON_TRADEABLE includes all */NGN pairs
+MAX_FOREX_PER_SCAN=1
+Crypto rank boost active
+Upload full .py files from Grok deploy package if not present.
