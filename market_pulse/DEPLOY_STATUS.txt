@@ -1,0 +1,3 @@
+Status: deploying NGN-off + crypto slots
+Files to update: trade_scanner.py, forex_trade_engine.py, handlers.py
+Timestamp: 2026-08-31
