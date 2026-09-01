@@ -34,6 +34,11 @@ _p2p_cache: dict = {}
 _p2p_lock = threading.Lock()
 _P2P_CACHE_TTL = 300  # 5 minutes
 
+# Bybit P2P often returns 404 for NGN pairs here — cool down instead of spamming.
+_bybit_p2p_cooldown_until: dict = {}  # "ASSET/FIAT" -> unix ts
+_BYBIT_P2P_COOLDOWN_SEC = 1800  # 30 minutes
+_bybit_p2p_cooldown_logged: set = set()
+
 
 def _p2p_median(prices):
     if not prices:
@@ -85,9 +90,15 @@ def get_binance_p2p(side, asset, fiat_code):
 
 
 def get_bybit_p2p(side, asset, fiat_code):
+    """Bybit OTC list. On HTTP 404, cool down the pair to avoid log spam."""
+    pair_key = f"{(asset or '').upper()}/{(fiat_code or '').upper()}"
+    now = time.time()
+    until = _bybit_p2p_cooldown_until.get(pair_key, 0)
+    if now < until:
+        return None  # still in cooldown — silent
+
     try:
         bybit_side = "1" if side == "BUY" else "0"
-        # Bybit token ids are typically uppercase asset codes
         headers = {
             "Content-Type": "application/json",
             "User-Agent": random.choice(USER_AGENTS),
@@ -109,11 +120,24 @@ def get_bybit_p2p(side, asset, fiat_code):
             headers=headers,
             timeout=10,
         )
+        if resp.status_code == 404:
+            _bybit_p2p_cooldown_until[pair_key] = now + _BYBIT_P2P_COOLDOWN_SEC
+            if pair_key not in _bybit_p2p_cooldown_logged:
+                _bybit_p2p_cooldown_logged.add(pair_key)
+                logger.warning(
+                    "[P2P] Bybit source returned 404 for %s — disabled for %s minutes",
+                    pair_key,
+                    int(_BYBIT_P2P_COOLDOWN_SEC // 60),
+                )
+            return None
         if resp.status_code != 200:
             logger.warning("[BYBIT P2P] HTTP %s for %s/%s %s", resp.status_code, asset, fiat_code, side)
             return None
         items = ((resp.json() or {}).get("result") or {}).get("items") or []
         prices = [float(i["price"]) for i in items if i.get("price")]
+        # Success clears cooldown for this pair
+        _bybit_p2p_cooldown_until.pop(pair_key, None)
+        _bybit_p2p_cooldown_logged.discard(pair_key)
         return _p2p_median(prices) if prices else None
     except Exception as e:
         logger.error("[BYBIT P2P ERROR] %s/%s %s: %s", asset, fiat_code, side, e)

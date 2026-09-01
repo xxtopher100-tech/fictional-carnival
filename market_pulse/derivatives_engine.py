@@ -99,6 +99,15 @@ from market_pulse.websocket_protocol import (
 )
 
 DERIV_STALE_SECONDS = 45
+UNHEALTHY_AFTER_FAILURES = 5
+
+# Bybit linear (USDT perpetual) uses 1000x multipliers for some low-priced coins.
+# Subscribing to SHIBUSDT on /v5/public/linear is rejected; 1000SHIBUSDT is valid.
+BYBIT_LINEAR_REMAP = {
+    "SHIB": "1000SHIBUSDT",
+}
+# Coins with no reliable OKX SWAP under {COIN}-USDT-SWAP naming (log once, skip).
+OKX_SWAP_SKIP_COINS = frozenset({"FET", "TON"})
 UNHEALTHY_AFTER_FAILURES = 5      # consecutive reconnect failures before a provider is marked down
 LIQUIDATION_DEDUPE_WINDOW = 500   # how many recent liquidation keys to remember
 
@@ -245,7 +254,13 @@ class BybitLinearProvider(DerivativesProvider):
 
     def __init__(self, coins=None, orderbook_depth=50, on_liquidation=None):
         self._coins = [c for c in (coins or COINS) if c not in ("USDT", "USDC")]
-        self._symbol_map = {c + "USDT": c for c in self._coins}
+        self._symbol_map = {}
+        self._skipped_syms = set()  # rejected by exchange — do not resubscribe spam
+        for c in self._coins:
+            if c in BYBIT_LINEAR_REMAP:
+                self._symbol_map[BYBIT_LINEAR_REMAP[c]] = c
+            else:
+                self._symbol_map[c + "USDT"] = c
         self._depth = orderbook_depth
         self._on_liquidation = on_liquidation  # callback(normalized_liquidation_dict)
 
@@ -321,8 +336,12 @@ class BybitLinearProvider(DerivativesProvider):
                 logger.info("[DERIV BYBIT] Connected — subscribing %d symbols" % len(self._symbol_map))
 
                 topics = []
-                for sym in self._symbol_map:
+                for sym in list(self._symbol_map.keys()):
+                    if sym in self._skipped_syms:
+                        continue
                     topics += [f"tickers.{sym}", f"orderbook.{self._depth}.{sym}", f"allLiquidation.{sym}"]
+                if not topics:
+                    logger.warning("[DERIV BYBIT] No symbols left to subscribe — idling this cycle")
                 # Bybit caps args per subscribe message; chunk defensively.
                 for i in range(0, len(topics), 10):
                     _protocol_send_text(sock, json.dumps({"op": "subscribe", "args": topics[i:i + 10]}))
@@ -374,7 +393,22 @@ class BybitLinearProvider(DerivativesProvider):
 
         if "success" in msg and "op" in msg and msg.get("op") in ("subscribe", "ping"):
             if not msg.get("success"):
-                logger.warning("[DERIV BYBIT] Subscribe/ping rejected: %s" % msg.get("ret_msg"))
+                ret = str(msg.get("ret_msg") or msg.get("retMsg") or "")
+                # e.g. "tickers.SHIBUSDT handler not found" / invalid symbol
+                skipped = None
+                for sym in list(self._symbol_map.keys()):
+                    if sym and sym in ret:
+                        skipped = sym
+                        break
+                if skipped and skipped not in self._skipped_syms:
+                    self._skipped_syms.add(skipped)
+                    coin = self._symbol_map.get(skipped, "?")
+                    logger.warning(
+                        "[DERIV BYBIT] %s unsupported on linear stream (%s) — skipped",
+                        skipped, coin,
+                    )
+                elif not skipped:
+                    logger.warning("[DERIV BYBIT] Subscribe/ping rejected: %s" % ret)
             return
 
         topic = msg.get("topic", "")
@@ -509,7 +543,13 @@ class OKXProvider(DerivativesProvider):
 
     def __init__(self, coins=None):
         self._coins = [c for c in (coins or COINS) if c not in ("USDT", "USDC")]
-        self._symbol_map = {c + "-USDT-SWAP": c for c in self._coins}
+        self._symbol_map = {}
+        self._skipped_inst = set()
+        for c in self._coins:
+            if c in OKX_SWAP_SKIP_COINS:
+                logger.info("[DERIV OKX] Unsupported instrument %s-USDT-SWAP — skipped", c)
+                continue
+            self._symbol_map[c + "-USDT-SWAP"] = c
 
         self._lock = threading.Lock()
         self._snapshots: dict = {}
@@ -567,7 +607,9 @@ class OKXProvider(DerivativesProvider):
                 logger.info("[DERIV OKX] Connected — subscribing %d symbols" % len(self._symbol_map))
 
                 args = []
-                for sym in self._symbol_map:
+                for sym in list(self._symbol_map.keys()):
+                    if sym in self._skipped_inst:
+                        continue
                     args += [{"channel": "tickers", "instId": sym}, {"channel": "funding-rate", "instId": sym}]
                 for i in range(0, len(args), 20):
                     _protocol_send_text(sock, json.dumps({"op": "subscribe", "args": args[i:i + 20]}))
@@ -618,7 +660,20 @@ class OKXProvider(DerivativesProvider):
             return
         if msg.get("event") in ("subscribe", "error"):
             if msg.get("event") == "error":
-                logger.warning("[DERIV OKX] Subscribe error: %s" % msg.get("msg"))
+                msg_txt = str(msg.get("msg") or "")
+                arg = msg.get("arg") or {}
+                inst = arg.get("instId") or ""
+                # Parse instId from message text if present
+                if not inst:
+                    for sym in list(self._symbol_map.keys()):
+                        if sym in msg_txt:
+                            inst = sym
+                            break
+                if inst and inst not in self._skipped_inst:
+                    self._skipped_inst.add(inst)
+                    logger.warning("[DERIV OKX] Unsupported instrument %s — skipped", inst)
+                elif not inst:
+                    logger.warning("[DERIV OKX] Subscribe error: %s" % msg_txt)
             return
 
         arg = msg.get("arg", {})
