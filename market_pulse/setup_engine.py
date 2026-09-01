@@ -846,18 +846,16 @@ def score_open_trade_ideas(limit=20) -> list:
                 continue
 
             if expired and not terminal:
+                # Do NOT close here — outcome_monitor owns close + admin notify for EXPIRED.
                 try:
                     c.execute(
                         """UPDATE trade_ideas
-                           SET status='closed', closed_at=%s, result=%s, lifecycle_status=%s
+                           SET lifecycle_status=%s, result=%s
                            WHERE id=%s AND status='open'""",
-                        (now_s, "SETUP_EXPIRED", "SETUP_EXPIRED", idea_id),
+                        ("SETUP_EXPIRED", "SETUP_EXPIRED", idea_id),
                     )
-                except Exception:
-                    c.execute(
-                        "UPDATE trade_ideas SET status='closed', closed_at=%s, result=%s WHERE id=%s AND status='open'",
-                        (now_s, "SETUP_EXPIRED", idea_id),
-                    )
+                except Exception as e:
+                    logger.debug("[SCORE] expire stamp #%s: %s", idea_id, e)
                 results.append({"id": idea_id, "coin": coin, "tier": tier, "lifecycle": "SETUP_EXPIRED", **(path or {})})
                 continue
 

@@ -183,6 +183,11 @@ def _fmt_px(v) -> str:
 def monitor_open_trades(limit: int = 40) -> list:
     """Evaluate open trades; notify admin once per state transition."""
     _ensure_schema()
+    if not ADMIN_IDS:
+        logger.warning(
+            "[OUTCOME] ADMIN_IDS is empty — outcomes will update the ledger "
+            "but NO private Telegram DMs will be sent. Set ADMIN_IDS on Railway."
+        )
     cutoff = get_or_set_monitor_activation_cutoff()
     db = None
     events = []
@@ -195,9 +200,18 @@ def monitor_open_trades(limit: int = 40) -> list:
                    COALESCE(valid_until, ''), COALESCE(timeframe, '1H'),
                    COALESCE(last_notified_state, ''), COALESCE(status, 'open'),
                    COALESCE(lifecycle_status, ''),
-                   COALESCE(publication_status, 'PUBLISHED')
+                   COALESCE(publication_status, 'PUBLISHED'),
+                   COALESCE(result, '')
             FROM trade_ideas
             WHERE status = 'open'
+               OR (
+                    status = 'closed'
+                    AND COALESCE(last_notified_state, '') = ''
+                    AND COALESCE(result, '') IN (
+                        'TP1_HIT','TP2_HIT','STOP_HIT','BE_EXIT','EXPIRED',
+                        'TARGET_HIT','SETUP_EXPIRED','AMBIGUOUS'
+                    )
+               )
             ORDER BY id DESC
             LIMIT %s
             """,
@@ -209,11 +223,14 @@ def monitor_open_trades(limit: int = 40) -> list:
 
         for row in rows:
             try:
+                row = list(row)
+                while len(row) < 16:
+                    row.append("")
                 (
                     idea_id, coin, direction, entry_s, stop_s, t1_s, t2_s,
                     created_at, tier, valid_until, timeframe,
-                    last_notified, status, lifecycle, publication_status,
-                ) = (list(row) + ["PUBLISHED"] * 16)[:15]
+                    last_notified, status, lifecycle, publication_status, prior_result,
+                ) = row[:16]
             except Exception:
                 continue
 
@@ -223,6 +240,8 @@ def monitor_open_trades(limit: int = 40) -> list:
                     created_at, tier, valid_until, timeframe,
                     last_notified or "", now, now_s, events, cutoff,
                     publication_status=publication_status or "PUBLISHED",
+                    row_status=status or "open",
+                    prior_result=prior_result or "",
                 )
             except Exception as e:
                 logger.error("[OUTCOME] trade #%s error (isolated): %s", idea_id, e)
@@ -252,12 +271,83 @@ def _process_one_trade(
     created_at, tier, valid_until, timeframe, last_notified, now, now_s, events,
     cutoff=None,
     publication_status: str = "PUBLISHED",
+    row_status: str = "open",
+    prior_result: str = "",
 ):
     entry = _parse_level(entry_s)
     stop = _parse_level(stop_s)
     t1 = _parse_level(t1_s)
     t2 = _parse_level(t2_s)
     if not entry or not stop:
+        return
+
+    # Backfill: already closed in ledger but never DMed admin
+    if (
+        (row_status or "").lower() == "closed"
+        and not (last_notified or "").strip()
+        and (prior_result or "").strip()
+    ):
+        mapped = {
+            "TARGET_HIT": "TP1_HIT",
+            "SETUP_EXPIRED": "EXPIRED",
+            "TP1_HIT": "TP1_HIT",
+            "TP2_HIT": "TP2_HIT",
+            "STOP_HIT": "STOP_HIT",
+            "BE_EXIT": "BE_EXIT",
+            "EXPIRED": "EXPIRED",
+            "AMBIGUOUS": "AMBIGUOUS",
+        }.get(prior_result.strip().upper(), prior_result.strip().upper())
+        pub = (publication_status or "PUBLISHED").upper().strip()
+        historical = is_historical_trade(created_at, cutoff)
+        if historical:
+            logger.info(
+                "[OUTCOME] #%s %s backfill %s HISTORICAL (no Telegram)",
+                idea_id, coin, mapped,
+            )
+            try:
+                c.execute(
+                    "UPDATE trade_ideas SET last_notified_state=%s WHERE id=%s",
+                    (mapped, idea_id),
+                )
+            except Exception:
+                pass
+            return
+        if pub != "PUBLISHED":
+            logger.info(
+                "[OUTCOME] #%s %s backfill %s INTERNAL/%s (no Telegram)",
+                idea_id, coin, mapped, pub,
+            )
+            try:
+                c.execute(
+                    "UPDATE trade_ideas SET last_notified_state=%s WHERE id=%s",
+                    (mapped, idea_id),
+                )
+            except Exception:
+                pass
+            return
+        try:
+            c.execute(
+                """
+                UPDATE trade_ideas SET last_notified_state=%s
+                WHERE id=%s AND COALESCE(last_notified_state,'') = ''
+                RETURNING id
+                """,
+                (mapped, idea_id),
+            )
+            if c.fetchone():
+                msg = _format_trade_outcome_msg(
+                    idea_id, coin, direction, timeframe, tier,
+                    entry, stop, t1, t2, mapped, created_at,
+                    historical=False,
+                )
+                _notify_admins(msg)
+                logger.info(
+                    "[OUTCOME] #%s %s → %s BACKFILL notified (was closed, never DMed)",
+                    idea_id, coin, mapped,
+                )
+                events.append({"id": idea_id, "state": mapped, "backfill": True})
+        except Exception as e:
+            logger.warning("[OUTCOME] backfill #%s: %s", idea_id, e)
         return
 
     # Stale price guard
@@ -334,9 +424,10 @@ def _process_one_trade(
         new_state = outcome or "ACTIVE"
 
     # Live price assist — critical when 1H candles are empty (e.g. Binance geo-block).
-    # Crypto is continuous: if live price is beyond the stop on the loss side of entry,
-    # the path necessarily passed through entry → treat as STOP_HIT.
-    # TP only after price has reached/passed entry (or path already ACTIVE).
+    # Crypto is continuous: adverse price beyond stop ⇒ STOP (must have crossed entry).
+    # Favourable price beyond TP1/TP2 ⇒ TP (must have crossed entry to reach target).
+    # Do NOT require prior ACTIVE from candles — empty post-signal candles were
+    # leaving trades stuck in ENTRY_NOT_REACHED with no admin outcome DM.
     if price and new_state in (
         "ACTIVE", "STILL_OPEN", "ENTRY_NOT_REACHED", "", "None"
     ):
@@ -353,30 +444,23 @@ def _process_one_trade(
 
         if px and en:
             if is_long:
-                # Through stop (below stop) ⇒ must have crossed entry in continuous market
                 if st is not None and px <= st:
                     new_state = "STOP_HIT"
-                elif new_state in ("ACTIVE", "STILL_OPEN") or px <= en:
-                    # At/through entry: allow TP from live
-                    if tp2 is not None and px >= tp2:
-                        new_state = "TP2_HIT"
-                    elif tp1 is not None and px >= tp1:
-                        new_state = "TP1_HIT"
-                    elif px <= en or new_state in ("ACTIVE", "STILL_OPEN"):
-                        if new_state == "ENTRY_NOT_REACHED":
-                            new_state = "ACTIVE"
+                elif tp2 is not None and px >= tp2:
+                    new_state = "TP2_HIT"
+                elif tp1 is not None and px >= tp1:
+                    new_state = "TP1_HIT"
+                elif px >= en and new_state == "ENTRY_NOT_REACHED":
+                    new_state = "ACTIVE"
             else:
-                # Short: through stop (above stop) ⇒ crossed entry
                 if st is not None and px >= st:
                     new_state = "STOP_HIT"
-                elif new_state in ("ACTIVE", "STILL_OPEN") or px >= en:
-                    if tp2 is not None and px <= tp2:
-                        new_state = "TP2_HIT"
-                    elif tp1 is not None and px <= tp1:
-                        new_state = "TP1_HIT"
-                    elif px >= en or new_state in ("ACTIVE", "STILL_OPEN"):
-                        if new_state == "ENTRY_NOT_REACHED":
-                            new_state = "ACTIVE"
+                elif tp2 is not None and px <= tp2:
+                    new_state = "TP2_HIT"
+                elif tp1 is not None and px <= tp1:
+                    new_state = "TP1_HIT"
+                elif px <= en and new_state == "ENTRY_NOT_REACHED":
+                    new_state = "ACTIVE"
 
     if expired and new_state in ("ACTIVE", "ENTRY_NOT_REACHED", "STILL_OPEN"):
         new_state = "EXPIRED"
