@@ -21,6 +21,7 @@ import threading
 from logging.handlers import RotatingFileHandler
 
 from market_pulse.ai_engine import ask_ai
+from market_pulse.ai_narrative_guard import sanitize_ai_narrative, append_narrative_rules
 from market_pulse.alert_formatter import build_alert_message, build_no_signal_message
 from market_pulse.candle_engine import candles_ready, get_candles
 from market_pulse.config_runtime import logger
@@ -360,7 +361,9 @@ def build_morning_briefing_pro():
         f"If it says no confirmed setup, say so plainly instead of forcing a trade idea. "
         f"Also say whether the P2P spread makes it worth converting naira right now."
     )
-    ai, _ = ask_ai(ai_prompt)
+    ai, _ = ask_ai(append_narrative_rules(ai_prompt))
+    if ai:
+        ai = sanitize_ai_narrative(ai, fallback=ai)
     if not ai:
         ai = "Markets are setting up. Watch key levels and size your positions correctly."
 
@@ -499,7 +502,9 @@ def build_midday_snapshot_pro():
         f"never invent price levels that contradict or go beyond what it states. "
         f"If it says no confirmed setup, say so plainly instead of forcing a trade idea."
     )
-    ai, _ = ask_ai(ai_prompt)
+    ai, _ = ask_ai(append_narrative_rules(ai_prompt))
+    if ai:
+        ai = sanitize_ai_narrative(ai, fallback=ai)
     if not ai:
         ai = "Market consolidating. Wait for a directional close before committing."
 
@@ -650,7 +655,9 @@ def build_evening_recap_pro():
         f"on the REAL TECHNICAL DATA above — never invent price levels that contradict or go beyond "
         f"what it states. If it says no confirmed setup, clearly state: wait — and give one reason."
     )
-    ai, _ = ask_ai(ai_prompt)
+    ai, _ = ask_ai(append_narrative_rules(ai_prompt))
+    if ai:
+        ai = sanitize_ai_narrative(ai, fallback=ai)
     if not ai:
         ai = "Markets closed with mixed signals. Stay patient and wait for cleaner setups."
 
@@ -778,7 +785,7 @@ def build_weekly_edge_pro():
         f"Write in plain text, no asterisks, no headers with colons. "
         f"Use this exact structure with a blank line between each section:\n"
         f"WHAT DROVE THIS WEEK: 2 sentences. Tell them what actually moved markets — macro, sentiment shift, key events. Not just prices. Make it feel like they are getting context others missed.\n\n"
-        f"THE NIGERIAN ANGLE: 1–2 sentences. What did the naira and P2P spread do this week? Was it a good week to buy USDT or hold naira? Be direct.\n\n"
+        f"THE NIGERIAN ANGLE: 1–2 sentences. Summarize only the P2P figures provided (no invented causes). Was it a good week to buy USDT or hold naira? Be direct.\n\n"
         f"THE ONE COIN FOR NEXT WEEK: Name one coin. Give the exact price level you are watching. Explain in one sentence why the setup is interesting. This should feel like a tip from someone who has done the work.\n\n"
         f"LEVELS TO WATCH: BTC key resistance above. BTC key support below. One line each, no fluff.\n\n"
         f"MY POSITION GOING INTO NEXT WEEK: Base this STRICTLY on the REAL TECHNICAL DATA above — "
@@ -786,7 +793,9 @@ def build_weekly_edge_pro():
         f"If it says no confirmed setup, say you are flat/sitting out and give the one reason from the data.\n\n"
         f"End with exactly: NFA — manage your risk."
     )
-    ai, _ = ask_ai(ai_prompt)
+    ai, _ = ask_ai(append_narrative_rules(ai_prompt))
+    if ai:
+        ai = sanitize_ai_narrative(ai, fallback=ai)
     if not ai:
         # Fallback template — also grounded in the real technical data, not
         # an invented number. This used to compute a fake entry as

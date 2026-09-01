@@ -21,6 +21,7 @@ import threading
 from logging.handlers import RotatingFileHandler
 
 from market_pulse.ai_engine import ask_ai
+from market_pulse.ai_narrative_guard import sanitize_ai_narrative, append_narrative_rules
 from market_pulse.alerts import (
     _calc_trade_metrics, _validate_alert, _infer_direction,
     _format_trade_price, _parse_price_token,
@@ -315,7 +316,7 @@ def _build_trade_ai_prompt(coin, price, tier, sd, fg_val, p2p_str, analytics=Non
         f"TIMEFRAME: [1H / 4H / Daily / Weekly]\n"
         f"DIRECTION: [Long / Short]\n"
         f"RATIONALE: [2 sentences — must reference the market data above]\n"
-        f"NIGERIAN ANGLE: [1 sentence — naira/P2P relevance]\n"
+        f"NIGERIAN ANGLE: [1 sentence ONLY if P2P figures were provided — else omit or say unavailable]\n"
         f"Market Bias: [Strongly Bullish / Bullish / Neutral / Bearish / Strongly Bearish]\n"
         f"Entry: $[price]\n"
         f"Stop Loss: $[price]\n"
@@ -629,11 +630,11 @@ def build_trade_idea_message(coin, price, tier, trade, idea_id=0):
             lines.append(f"Valid until: <b>{vu}</b> WAT")
         lines.append("")
     if trade.get("rationale"):
-        rat = _strip_all_disclaimers(trade.get("rationale") or "")
+        rat = sanitize_ai_narrative(_strip_all_disclaimers(trade.get("rationale") or ""), fallback="")
         if rat:
             lines += ["📋 <b>SETUP</b>", rat, ""]
     if trade.get("ng_angle"):
-        nga = _strip_all_disclaimers(trade.get("ng_angle") or "")
+        nga = sanitize_ai_narrative(_strip_all_disclaimers(trade.get("ng_angle") or ""), fallback="")
         if nga:
             lines += ["🇳🇬 <b>NIGERIAN ANGLE</b>", nga, ""]
     lines += ["· " * 18, ""]
@@ -707,18 +708,21 @@ def generate_trade_idea(coin, tier="momentum"):
                 return None, None, 0
             try:
                 news = news_market_flag(coin)
-                explain_prompt = (
+                explain_prompt = append_narrative_rules(
                     f"{coin} {tier.upper()} setup already computed by rules.\n"
                     f"Direction: {setup['direction']} Entry: {setup['entry']} "
                     f"Stop: {setup['stop']} TP1: {setup['target1']} TP2: {setup['target2']}\n"
                     f"Reasons: {setup.get('rationale')}\n"
                     f"News flag: {news.get('flag')}\n"
-                    f"Write 2 short sentences for Nigerian traders explaining WHY this structure "
-                    f"matters. Do NOT change any prices, R:R, or invent new levels."
+                    f"Write 2 short technical sentences about price vs levels only.\n"
+                    f"Do NOT invent P2P/naira causality, whales, or news.\n"
+                    f"Do NOT change any prices, R:R, or invent new levels."
                 )
                 ai_raw, _ = ask_ai(explain_prompt)
                 if ai_raw:
-                    setup["rationale"] = (ai_raw.strip()[:500] + "\n\n" + setup.get("rationale", "")).strip()
+                    ai_clean = sanitize_ai_narrative(ai_raw.strip()[:500], fallback="")
+                    if ai_clean:
+                        setup["rationale"] = (ai_clean + "\n\n" + (setup.get("rationale") or "")).strip()
             except Exception as _e:
                 logger.debug(f"[TRADE ENGINE] {tier} narrative skip: {_e}")
             direction = setup.get("direction", "Long").lower()

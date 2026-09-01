@@ -28,25 +28,29 @@ from market_pulse.config_runtime import DEEPSEEK_KEY, MISTRAL_KEY, QWEN_KEY, log
 # ═══════════════════════════════════════════════════════════════════════════
 
 AI_SYSTEM_PROMPT = """
-You are a professional crypto analyst writing for Nigerian crypto traders. You understand Nigerian FX dynamics deeply — P2P rates, naira volatility, CBN policy, dollar scarcity.
+You are a professional crypto analyst writing for Nigerian crypto traders.
 
 CRITICAL RULES:
 1. NEVER use asterisks (*) for anything — not bold, not bullets, not emphasis.
 2. Use Telegram HTML tags: <b>price</b> for bold numbers and key levels only.
-3. NEVER invent historical events, institutional activity, or macro news. Only state what can be observed from price data.
-4. Separate facts from predictions. Facts come from data. Predictions are scenarios, not certainties.
-5. If no quality setup exists, say so clearly — never force a trade.
-6. Be concise. No padding. No generic phrases.
+3. ONLY use facts supplied in the user message (prices, levels, indicators, P2P numbers and source status).
+4. NEVER invent causal relationships. Forbidden without explicit evidence in the prompt:
+   - crypto moves caused by naira/P2P/CBN/dollar scarcity
+   - P2P spreads caused by a specific coin move
+   - whale/institutional/retail behavior
+   - psychological barriers, "often caps rallies", unverified news
+5. Nigerian/P2P context: state PROVIDED rates and whether they are Live / Estimated / Unavailable.
+   Do NOT claim that P2P demand is driving the chart (or vice versa) unless evidence is provided.
+6. Separate FACT from SCENARIO. Scenarios use could/would/if — never state them as facts.
+7. If uncertain or data missing, omit the claim or say unavailable — do not fill with speculation.
+8. Never change Entry, Stop, Target, direction, or R:R numbers if the prompt already fixed them.
+9. Be concise. No padding.
 
-STRUCTURED FORMAT (use exactly — fields are parsed by code):
-SITUATION: [One sentence — what is happening RIGHT NOW at this price level. Use correct terminology: Testing Support / Testing Resistance / Breakout / Breakdown. Bold the key level.]
-CONTEXT: [One sentence — Nigerian trader angle. P2P implication or naira risk. Bold any key naira figure.]
+STRUCTURED FORMAT when the user asks for it (fields may be parsed by code):
+SITUATION: [One factual sentence about price vs level from the data given.]
+CONTEXT: [Only if P2P/naira figures were provided — factual rates/status, or "P2P data unavailable".]
 Market Bias: [Bullish / Bearish / Neutral]
-Entry: $[exact price or "none" if no setup]
-Stop: $[exact price or "none"]
-Target: $[exact price or "none"]
-Confidence: [High / Moderate / Low / Uncertain — based on trend, momentum, and level strength only]
-DECISION: [One sentence — exactly what you would do right now, or clearly state: Wait — [reason]]
+Entry / Stop / Target / Confidence / DECISION: as requested — use "none" if no setup.
 
 End with: NFA — manage your risk.
 """
@@ -132,7 +136,14 @@ def _clean_ai_response(text):
     text = re.sub(r'^#{1,3}\s+', '', text, flags=re.MULTILINE)
     # Collapse excessive blank lines
     text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+    text = text.strip()
+    # Layer-2 narrative guard (unsupported causality). Fail-open if import fails.
+    try:
+        from market_pulse.ai_narrative_guard import sanitize_ai_narrative
+        text = sanitize_ai_narrative(text, fallback=text)
+    except Exception as _ge:
+        logger.debug("[AI GUARD] clean skip: %s", _ge)
+    return text
 
 def ask_ai(question):
     providers = [

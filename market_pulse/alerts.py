@@ -959,6 +959,12 @@ def _sanitize_key_situation(text: str) -> str:
         return ""
     import re as _re
     t = text.strip()
+    try:
+        t = sanitize_ai_narrative(t, fallback="")
+    except Exception:
+        pass
+    if not t:
+        return ""
     # Causal P2P/naira claims → drop entire situation
     if _re.search(
         r"(because|due to|drives|causing|leads to|as a result of).{0,60}(P2P|naira|₦|NGN)"
