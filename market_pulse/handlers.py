@@ -1396,18 +1396,18 @@ def run():
                                     "💱 <b>Forex Trade Idea Generator</b>\n\n"
                                     "Usage: /forex [PAIR] [tier]\n\n"
                                     "Pairs:\n"
-                                    "  USDT/NGN  USD/NGN  BTC/NGN\n"
+                                    "  EUR/USD  GBP/USD\n"
                                     "  EUR/USD   GBP/USD\n\n"
                                     "Tiers: steady | momentum | edge\n\n"
                                     "Examples:\n"
-                                    "/forex USDT/NGN momentum\n"
+                                    "/forex EUR/USD momentum\n"
                                     "/forex EUR/USD steady\n"
-                                    "/forex USD/NGN edge"
+                                    "/forex GBP/USD edge"
                                 )
                                 continue
                             pair_arg = parts[1].upper().replace("-", "/")
                             tier_arg = parts[2].lower()
-                            if pair_arg == "USDT/NGN":
+                            if pair_arg in ("USDT/NGN", "USD/NGN", "BTC/NGN", "EUR/NGN", "GBP/NGN") or str(pair_arg).upper().endswith("/NGN"):
                                 send(chat_id, "⚠️ USDT/NGN is local context/P2P only — not a tradeable setup pair.")
                                 continue
                             if pair_arg not in FOREX_PAIRS:
@@ -2753,8 +2753,8 @@ def run():
                         if "_" in pair_safe:
                             a, b = pair_safe.split("_", 1)
                             pair = f"{a}/{b}"
-                        if pair == "USDT/NGN":
-                            edit(chat_id, message_id, "USDT/NGN is P2P/context only — not a trade setup.", FOREX_MENU)
+                        if pair in ("USDT/NGN", "USD/NGN", "BTC/NGN", "EUR/NGN", "GBP/NGN") or str(pair).upper().endswith("/NGN"):
+                            edit(chat_id, message_id, "NGN pairs are P2P/rate context only — not trade setups. Use EUR/USD or GBP/USD.", FOREX_MENU)
                             continue
                         if pair not in FOREX_PAIRS or tier not in TRADE_TIERS:
                             edit(chat_id, message_id, "Unknown pair or tier.", FOREX_MENU)

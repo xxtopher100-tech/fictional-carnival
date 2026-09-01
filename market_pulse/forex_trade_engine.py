@@ -73,7 +73,10 @@ FOREX_PAIRS = {
 MORNING_FOREX_PAIRS = ["USDT/NGN", "EUR/NGN", "GBP/NGN", "EUR/USD", "GBP/USD"]  # rates/context OK
 
 # Pairs that must never become SAFE/NORMAL/EDGE trade setups
-NON_TRADEABLE_FOREX_PAIRS = frozenset({"USDT/NGN"})
+NON_TRADEABLE_FOREX_PAIRS = frozenset({
+    "USDT/NGN", "USD/NGN", "BTC/NGN", "EUR/NGN", "GBP/NGN",
+})  # NGN pairs = rates/P2P context only — never Pro trade setups
+
 
 
 _rate_cache = {}
@@ -452,8 +455,8 @@ def build_forex_trade_message(pair_key, rate, tier, trade, idea_id=0, source_str
 
 
 def generate_forex_trade_idea(pair_key, tier="momentum"):
-    """Generate a forex trade idea. USDT/NGN is context-only — never a trade setup."""
-    if pair_key in NON_TRADEABLE_FOREX_PAIRS:
+    """Generate a forex trade idea. Any */NGN pair is context-only — never a trade setup."""
+    if pair_key in NON_TRADEABLE_FOREX_PAIRS or str(pair_key).upper().endswith("/NGN"):
         logger.info("[FOREX] %s is not tradeable (local context only) — skip setup", pair_key)
         return None, None, None
     """Fetch rate → news gate → programmatic levels preferred → validate → save."""

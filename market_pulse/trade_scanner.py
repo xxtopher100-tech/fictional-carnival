@@ -35,7 +35,7 @@ from market_pulse.macro_event_scanner import apply_macro_publication_gate
 
 # ── Markets (USDT/NGN is context-only — not listed here) ─────────────────────
 SCANNER_CRYPTO_COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "AVAX", "LINK", "DOGE"]
-SCANNER_FOREX_PAIRS = ["USD/NGN", "BTC/NGN", "EUR/USD", "GBP/USD"]
+SCANNER_FOREX_PAIRS = ["EUR/USD", "GBP/USD"]  # no NGN trade pairs — P2P/rates stay elsewhere
 SCANNER_TIER_ORDER = ["steady", "momentum", "edge"]
 
 # ── Configurable publish policy (env) ───────────────────────────────────────
@@ -49,8 +49,26 @@ def _env_int(name: str, default: int) -> int:
 # Discovery is never stopped by these; they only limit how many ranked setups post.
 MAX_TRADES_PER_SCAN = _env_int("MAX_TRADES_PER_SCAN", 2)
 MAX_TRADES_PER_DAY = _env_int("MAX_TRADES_PER_DAY", 5)
+# Hard ceiling even when a later setup is better (anti-spam)
+MAX_TRADES_PER_DAY_HARD = _env_int("MAX_TRADES_PER_DAY_HARD", 8)
+# Forex is secondary product — do not let SAFE FX fill the whole scan budget
+MAX_FOREX_PER_SCAN = _env_int("MAX_FOREX_PER_SCAN", 1)
 # Seconds between scan *starts* (default 1H to align with 1H structure; was 14400).
 TRADE_SCAN_INTERVAL_SEC = _env_int("TRADE_SCAN_INTERVAL_SEC", 3600)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+
+# Soft daily cap: if day is "full", still allow a post when score beats weakest
+# published today by at least this margin.
+SCORE_REPLACE_MARGIN = _env_float("SCORE_REPLACE_MARGIN", 12.0)
+# Quality floor — weak setups should not burn a seat
+MIN_PUBLISH_SCORE = _env_float("MIN_PUBLISH_SCORE", 40.0)
 
 # Major-crypto correlation groups (simple deterministic exposure)
 _MAJOR_CRYPTO = frozenset({"BTC", "ETH", "SOL", "BNB", "AVAX", "LINK", "DOGE", "XRP"})
@@ -216,6 +234,59 @@ def _daily_published_count() -> int:
                 pass
 
 
+
+def _weakest_published_score_today() -> float | None:
+    """Lowest rank-score among PUBLISHED candidates today (None if none)."""
+    today = wat_now().strftime("%Y-%m-%d")
+    db = None
+    try:
+        db = get_db()
+        c = db.cursor()
+        start, end = f"{today} 00:00:00", f"{today} 23:59:59"
+        c.execute(
+            """
+            SELECT MIN(score) FROM trade_scan_candidates
+            WHERE status='PUBLISHED' AND created_at >= %s AND created_at <= %s
+              AND score IS NOT NULL
+            """,
+            (start, end),
+        )
+        row = c.fetchone()
+        if not row or row[0] is None:
+            return None
+        return float(row[0])
+    except Exception as e:
+        logger.debug("[SCANNER] weakest score today: %s", e)
+        return None
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _may_publish_over_soft_cap(candidate_score: float, already_today: int) -> tuple[bool, str]:
+    """When soft daily cap is full, allow a clearly better setup up to HARD max.
+
+    Returns (allowed, reason_code).
+    """
+    score = float(candidate_score or 0)
+    if already_today < MAX_TRADES_PER_DAY:
+        return True, "UNDER_SOFT_CAP"
+    if already_today >= MAX_TRADES_PER_DAY_HARD:
+        return False, "HARD_DAY_CAP"
+    weakest = _weakest_published_score_today()
+    if weakest is None:
+        # Cap full but no scores stored — allow only high-confidence overflow
+        if score >= MIN_PUBLISH_SCORE + SCORE_REPLACE_MARGIN:
+            return True, "OVERFLOW_NO_BASELINE"
+        return False, "SOFT_CAP_NO_BASELINE"
+    if score >= weakest + SCORE_REPLACE_MARGIN:
+        return True, "OVERFLOW_BETTER_THAN_WEAKEST"
+    return False, "SOFT_CAP_NOT_BETTER"
+
+
 def _correlation_group(symbol: str, direction: str) -> str:
     sym = (symbol or "").upper().split("/")[0]
     d = (direction or "long").lower()
@@ -227,8 +298,13 @@ def _correlation_group(symbol: str, direction: str) -> str:
     return f"{sym}_{side}"
 
 
-def _rank_score(trade: dict, tier: str) -> float:
-    """Signal-time only score. No future candles / outcomes."""
+def _rank_score(trade: dict, tier: str, asset_type: str = "crypto") -> float:
+    """Signal-time only score. No future candles / outcomes.
+
+    Crypto is the primary MarketPulse product; forex is secondary context.
+    A small crypto bias prevents SAFE FX from consuming the entire publish budget.
+    Does NOT change Entry/SL/TP math.
+    """
     score = 0.0
     conf = str((trade or {}).get("confidence") or "Moderate")
     score += {"High": 30.0, "Moderate": 15.0, "Low": 5.0}.get(conf, 10.0)
@@ -246,6 +322,9 @@ def _rank_score(trade: dict, tier: str) -> float:
             score += min(float(m["rr"]), 5.0) * 10.0
     except Exception:
         pass
+    # Product priority (not strategy quality): crypto > forex at publish time
+    if (asset_type or "").lower() == "crypto":
+        score += 25.0
     return score
 
 
@@ -381,7 +460,7 @@ def run_trade_scanner():
                 continue
 
             direction = str((trade or {}).get("direction") or "long")
-            score = _rank_score(trade, tier)
+            score = _rank_score(trade, tier, asset_type=asset_type)
             ranked.append(
                 {
                     "asset_type": asset_type,
@@ -462,37 +541,33 @@ def run_trade_scanner():
     ranked = still_ranked
 
     # ── Phase D: CORRELATION + CAPS → PUBLISH or SUPPRESS ────────────────
+    # Soft daily cap (MAX_TRADES_PER_DAY) + hard ceiling (MAX_TRADES_PER_DAY_HARD).
+    # If the soft cap is full, a clearly better setup may still post (overflow).
     already_today = _daily_published_count()
-    room_day = max(0, MAX_TRADES_PER_DAY - already_today)
     room_scan = max(0, MAX_TRADES_PER_SCAN)
-    budget = min(room_day, room_scan)
+    weakest_today = _weakest_published_score_today()
 
     used_groups = set()
     published = 0
+    forex_published = 0
+    overflow_posts = 0
 
-    if budget <= 0:
-        logger.info(
-            "[SCANNER] Publish budget 0 (day=%s/%s) — all qualified suppressed",
-            already_today,
-            MAX_TRADES_PER_DAY,
-        )
-        for item in ranked:
-            record_candidate(
-                scan_run_id,
-                item["identifier"],
-                item["tier"],
-                "SUPPRESSED",
-                rejection_reason="PUBLISH_LIMIT",
-                direction=item.get("direction"),
-                idea_id=item.get("idea_id"),
-                score=item.get("score"),
-            )
-            mark_trade_publication(item.get("idea_id"), "SUPPRESSED", "PUBLISH_LIMIT")
-        finish_scan_run(scan_run_id, markets_scanned=markets_touched, error_count=scan_errors)
-        return
+    logger.info(
+        "[SCANNER] Publish policy soft_day=%s/%s hard=%s scan_cap=%s min_score=%.1f "
+        "replace_margin=%.1f weakest_today=%s",
+        already_today,
+        MAX_TRADES_PER_DAY,
+        MAX_TRADES_PER_DAY_HARD,
+        room_scan,
+        MIN_PUBLISH_SCORE,
+        SCORE_REPLACE_MARGIN,
+        weakest_today,
+    )
 
     for item in ranked:
         group = _correlation_group(item["identifier"], item.get("direction") or "long")
+        score = float(item.get("score") or 0)
+
         if group in used_groups:
             record_candidate(
                 scan_run_id,
@@ -502,7 +577,7 @@ def run_trade_scanner():
                 rejection_reason="CORRELATED_SUPPRESSED",
                 direction=item.get("direction"),
                 idea_id=item.get("idea_id"),
-                score=item.get("score"),
+                score=score,
             )
             mark_trade_publication(item.get("idea_id"), "SUPPRESSED", "CORRELATED_SUPPRESSED")
             logger.info(
@@ -511,26 +586,99 @@ def run_trade_scanner():
             )
             continue
 
-        if published >= budget:
+        # Quality floor — do not burn seats on weak setups
+        if score < MIN_PUBLISH_SCORE:
             record_candidate(
                 scan_run_id,
                 item["identifier"],
                 item["tier"],
                 "SUPPRESSED",
-                rejection_reason="PUBLISH_LIMIT",
+                rejection_reason="BELOW_MIN_SCORE",
                 direction=item.get("direction"),
                 idea_id=item.get("idea_id"),
-                score=item.get("score"),
+                score=score,
             )
-            mark_trade_publication(item.get("idea_id"), "SUPPRESSED", "PUBLISH_LIMIT")
+            mark_trade_publication(item.get("idea_id"), "SUPPRESSED", "BELOW_MIN_SCORE")
+            logger.info(
+                "[SCANNER] SUPPRESSED %s %s score=%.1f < min %.1f",
+                item["identifier"], item["tier"], score, MIN_PUBLISH_SCORE,
+            )
             continue
+
+        # Cap forex so secondary FX cannot fill every Pro slot
+        if (item.get("asset_type") or "") == "forex" and forex_published >= MAX_FOREX_PER_SCAN:
+            record_candidate(
+                scan_run_id,
+                item["identifier"],
+                item["tier"],
+                "SUPPRESSED",
+                rejection_reason="FOREX_CAP",
+                direction=item.get("direction"),
+                idea_id=item.get("idea_id"),
+                score=score,
+            )
+            mark_trade_publication(item.get("idea_id"), "SUPPRESSED", "FOREX_CAP")
+            logger.info(
+                "[SCANNER] FOREX_CAP suppressed %s %s (max %s/scan)",
+                item["identifier"], item["tier"], MAX_FOREX_PER_SCAN,
+            )
+            continue
+
+        # Per-scan seat limit (always enforced)
+        if published >= room_scan:
+            record_candidate(
+                scan_run_id,
+                item["identifier"],
+                item["tier"],
+                "SUPPRESSED",
+                rejection_reason="SCAN_CAP",
+                direction=item.get("direction"),
+                idea_id=item.get("idea_id"),
+                score=score,
+            )
+            mark_trade_publication(item.get("idea_id"), "SUPPRESSED", "SCAN_CAP")
+            continue
+
+        # Soft daily cap with overflow for clearly better setups
+        projected_today = already_today + published
+        ok_day, day_reason = _may_publish_over_soft_cap(score, projected_today)
+        if not ok_day:
+            record_candidate(
+                scan_run_id,
+                item["identifier"],
+                item["tier"],
+                "SUPPRESSED",
+                rejection_reason=day_reason,
+                direction=item.get("direction"),
+                idea_id=item.get("idea_id"),
+                score=score,
+            )
+            mark_trade_publication(item.get("idea_id"), "SUPPRESSED", day_reason)
+            logger.info(
+                "[SCANNER] SUPPRESSED %s %s score=%.1f — %s (day %s soft=%s hard=%s)",
+                item["identifier"],
+                item["tier"],
+                score,
+                day_reason,
+                projected_today,
+                MAX_TRADES_PER_DAY,
+                MAX_TRADES_PER_DAY_HARD,
+            )
+            continue
+
+        is_overflow = projected_today >= MAX_TRADES_PER_DAY
 
         try:
             post_to_pro_channel(item["msg"])
             used_groups.add(group)
             published += 1
+            if (item.get("asset_type") or "") == "forex":
+                forex_published += 1
+            if is_overflow:
+                overflow_posts += 1
             _scanner_daily_count["count"] = already_today + published
-            mark_trade_publication(item.get("idea_id"), "PUBLISHED", "PRO_CHANNEL")
+            pub_reason = "PRO_CHANNEL_OVERFLOW" if is_overflow else "PRO_CHANNEL"
+            mark_trade_publication(item.get("idea_id"), "PUBLISHED", pub_reason)
             record_candidate(
                 scan_run_id,
                 item["identifier"],
@@ -538,16 +686,17 @@ def run_trade_scanner():
                 "PUBLISHED",
                 direction=item.get("direction"),
                 idea_id=item.get("idea_id"),
-                score=item.get("score"),
+                score=score,
             )
             logger.info(
-                "[SCANNER] PUBLISHED #%s %s %s score=%.1f (%s/%s this scan)",
+                "[SCANNER] PUBLISHED #%s %s %s score=%.1f (%s/%s this scan)%s",
                 item["idea_id"],
                 item["identifier"],
                 item["tier"],
-                item["score"],
+                score,
                 published,
-                budget,
+                room_scan,
+                f" OVERFLOW vs weakest={weakest_today}" if is_overflow else "",
             )
         except Exception as e:
             scan_errors += 1
@@ -567,10 +716,11 @@ def run_trade_scanner():
 
     finish_scan_run(scan_run_id, markets_scanned=markets_touched, error_count=scan_errors)
     logger.info(
-        "[SCANNER] Complete — prequalified=%s setups=%s published=%s errors=%s",
+        "[SCANNER] Complete — prequalified=%s setups=%s published=%s overflow=%s errors=%s",
         len(prequalified),
         len(ranked),
         published,
+        overflow_posts,
         scan_errors,
     )
 
