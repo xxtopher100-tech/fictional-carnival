@@ -1173,9 +1173,12 @@ def run():
 
                         if text.startswith("/forceoutcomes"):
                             try:
-                                from market_pulse.outcome_monitor import run_outcome_cycle, monitor_open_trades
+                                from market_pulse.outcome_monitor import (
+                                    monitor_open_trades,
+                                    diagnose_open_trades,
+                                )
                                 from market_pulse.config_runtime import ADMIN_IDS as _AIDS
-                                send(chat_id, "⏳ Running outcome cycle now…")
+                                send(chat_id, "⏳ Running outcome cycle + diagnostic…")
                                 if not _AIDS:
                                     send(
                                         chat_id,
@@ -1183,15 +1186,8 @@ def run():
                                         "Outcomes cannot DM anyone. Set ADMIN_IDS to your Telegram user id.",
                                     )
                                 ev = monitor_open_trades(limit=80)
-                                if not ev:
-                                    send(
-                                        chat_id,
-                                        "✅ Cycle finished.\n"
-                                        "No new TP/SL/expiry transitions.\n"
-                                        "Check Railway logs for <code>[OUTCOME] cycle:</code>",
-                                    )
-                                else:
-                                    lines = ["✅ <b>Outcome events</b>"]
+                                if ev:
+                                    lines = ["✅ <b>Outcome events this cycle</b>"]
                                     for e in ev[:25]:
                                         lines.append(
                                             f"#{e.get('id')} → {e.get('state')} "
@@ -1199,6 +1195,21 @@ def run():
                                             f"{'(backfill)' if e.get('backfill') else ''}"
                                         )
                                     send(chat_id, "\n".join(lines))
+                                else:
+                                    send(
+                                        chat_id,
+                                        "✅ Cycle finished — <b>no new TP/SL/expiry transitions</b>.\n"
+                                        "That usually means price is still between entry and stop/TP, "
+                                        "or trades are already notified / not in the ledger.",
+                                    )
+                                # Always show why
+                                diag = diagnose_open_trades(limit=15)
+                                # Telegram message limit — split if needed
+                                if len(diag) > 3500:
+                                    send(chat_id, diag[:3500])
+                                    send(chat_id, diag[3500:7000])
+                                else:
+                                    send(chat_id, diag)
                             except Exception as _fe:
                                 logger.error("[FORCE OUTCOMES] %s", _fe)
                                 send(chat_id, f"❌ Force outcomes failed: {_fe}")

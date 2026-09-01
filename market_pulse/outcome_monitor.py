@@ -1319,6 +1319,117 @@ def send_weekly_report_private(force: bool = False) -> bool:
                 pass
 
 
+
+
+def diagnose_open_trades(limit: int = 25) -> str:
+    """Admin diagnostic: why outcomes may not fire. No secrets. Does not change state."""
+    _ensure_schema()
+    lines = [
+        "<b>OUTCOME DIAGNOSTIC</b>",
+        f"ADMIN_IDS set: <b>{'yes (' + str(len(ADMIN_IDS)) + ')' if ADMIN_IDS else 'NO — no DMs possible'}</b>",
+    ]
+    cutoff = get_or_set_monitor_activation_cutoff()
+    lines.append(f"Monitor activation cutoff: <code>{cutoff or 'none'}</code>")
+    db = None
+    try:
+        db = get_db()
+        c = db.cursor()
+        c.execute(
+            """
+            SELECT id, coin, direction, entry, stop, target1, target2, created_at,
+                   COALESCE(status,'open'), COALESCE(last_notified_state,''),
+                   COALESCE(publication_status,'PUBLISHED'), COALESCE(result,''),
+                   COALESCE(lifecycle_status,''), COALESCE(timeframe,'')
+            FROM trade_ideas
+            WHERE status = 'open'
+               OR (status = 'closed' AND COALESCE(last_notified_state,'') = '')
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = c.fetchall() or []
+        lines.append(f"Rows to evaluate: <b>{len(rows)}</b>")
+        if not rows:
+            lines.append("")
+            lines.append("No open trades and no closed-unnotified trades.")
+            lines.append("If you only post setups without saving to trade_ideas, outcomes cannot track them.")
+            return "\n".join(lines)
+
+        for row in rows:
+            (
+                idea_id, coin, direction, entry_s, stop_s, t1_s, t2_s, created_at,
+                status, last_not, pub, result, lifecycle, tf,
+            ) = (list(row) + [""] * 14)[:14]
+            entry = _parse_level(entry_s)
+            stop = _parse_level(stop_s)
+            t1 = _parse_level(t1_s)
+            t2 = _parse_level(t2_s)
+            price, _ = get_best_price(coin) if coin else (None, None)
+            hist = is_historical_trade(created_at, cutoff)
+            reasons = []
+            if not entry or not stop:
+                reasons.append("bad entry/stop parse")
+            if not price:
+                reasons.append(f"no live price for '{coin}'")
+            if hist:
+                reasons.append("HISTORICAL (no DM by policy)")
+            if (pub or "PUBLISHED").upper() != "PUBLISHED":
+                reasons.append(f"pub={pub}")
+            if last_not:
+                reasons.append(f"already notified={last_not}")
+
+            # Live assist snapshot
+            snap = "n/a"
+            if price and entry and stop:
+                d = (direction or "long").lower()
+                is_long = d.startswith("long") or d in ("buy", "l")
+                px = float(price)
+                en = float(entry)
+                st = float(stop)
+                tp1 = float(t1) if t1 else None
+                if is_long:
+                    if px <= st:
+                        snap = "would STOP_HIT"
+                    elif tp1 and px >= tp1:
+                        snap = "would TP1_HIT"
+                    elif px >= en:
+                        snap = "ACTIVE (through entry)"
+                    else:
+                        snap = "ENTRY_NOT_REACHED"
+                else:
+                    if px >= st:
+                        snap = "would STOP_HIT"
+                    elif tp1 and px <= tp1:
+                        snap = "would TP1_HIT"
+                    elif px <= en:
+                        snap = "ACTIVE (through entry)"
+                    else:
+                        snap = "ENTRY_NOT_REACHED"
+
+            lines.append("")
+            lines.append(f"<b>#{idea_id} {coin}</b> {(direction or '').upper()} · {status}")
+            lines.append(f"Entry {_fmt_px(entry)} · Stop {_fmt_px(stop)} · TP1 {_fmt_px(t1)}")
+            lines.append(f"Live: {_fmt_px(price) if price else '—'} · Assist: {snap}")
+            lines.append(f"created {created_at} · last_notified={last_not or '—'} · result={result or '—'}")
+            if reasons:
+                lines.append("Blockers: " + "; ".join(reasons))
+            else:
+                lines.append("No hard blockers — may still be open (price between entry and TP/SL).")
+    except Exception as e:
+        lines.append(f"Diagnostic error: {e}")
+        logger.error("[OUTCOME DIAG] %s", e)
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
+    lines.append("")
+    lines.append("<i>If Assist says would TP/SL but no DM: deploy latest outcome_monitor + check ADMIN_IDS.</i>")
+    return "\n".join(lines)
+
+
 def run_outcome_cycle():
     """Single safe cycle: trades + key levels. Never raises to caller."""
     try:
