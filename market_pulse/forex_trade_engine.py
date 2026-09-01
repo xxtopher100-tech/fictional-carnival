@@ -22,7 +22,10 @@ from market_pulse.ai_narrative_guard import (
 )
 from market_pulse.config_runtime import logger
 from market_pulse.db import get_db
-from market_pulse.edge_trade_engine import EDGE_DISCLAIMER, STANDARD_DISCLAIMER, TRADE_TIERS, mark_trade_publication
+from market_pulse.edge_trade_engine import (
+    EDGE_DISCLAIMER, STANDARD_DISCLAIMER, TRADE_TIERS, mark_trade_publication,
+    _finalize_trade_message, _strip_all_disclaimers,
+)
 from market_pulse.fear_greed import get_fear_greed
 from market_pulse.helpers import format_forex, format_ngn, wat_now
 from market_pulse.p2p import get_p2p_rate
@@ -451,8 +454,8 @@ def build_forex_trade_message(pair_key, rate, tier, trade, idea_id=0, source_str
     )
     lines += ["🛡️ <b>TRADE MANAGEMENT</b>", mgmt, ""]
     lines += ["· · · · · · · · · · · · · · · · · · ·", ""]
-    lines.append(EDGE_DISCLAIMER if tier == "edge" else STANDARD_DISCLAIMER)
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    return _finalize_trade_message(body, tier)
 
 
 def generate_forex_trade_idea(pair_key, tier="momentum"):

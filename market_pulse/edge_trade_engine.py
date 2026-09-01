@@ -96,13 +96,11 @@ STANDARD_DISCLAIMER = (
 
 
 def _strip_all_disclaimers(text: str) -> str:
-    """Aggressively remove every risk-disclaimer block."""
+    """Aggressively remove every risk-disclaimer / footer block (any count)."""
     if not text:
         return ""
-    t = str(text)
-    # Cut everything from first RISK DISCLAIMER header to end, repeatedly
-    # (also handle HTML <b> and emoji variants)
     import re as _re
+    t = str(text)
     for _ in range(50):
         upper = t.upper()
         idx = upper.find("RISK DISCLAIMER")
@@ -110,20 +108,26 @@ def _strip_all_disclaimers(text: str) -> str:
             idx = upper.find("HIGH-RISK SETUP")
         if idx < 0:
             break
-        # walk back to include leading separator line if present
         cut_from = idx
         line_start = t.rfind("\n", 0, idx)
         if line_start >= 0:
-            prefix = t[line_start+1:idx]
-            if all(ch in "━─\u2501\u2500-= \t\u26a0\ufe0f*" or ord(ch) > 0x2500 for ch in prefix.strip()) or "⚠" in prefix:
+            prefix = t[line_start + 1:idx]
+            if all(
+                ch in "━─\u2501\u2500-= \t\u26a0\ufe0f*" or ord(ch) > 0x2500
+                for ch in prefix.strip()
+            ) or "⚠" in prefix:
                 cut_from = line_start + 1
         t = t[:cut_from].rstrip()
-    # Remove leftover illustrative footer
-    t = _re.sub(
-        r"(?is)<i>Illustrative only\..*?Market Pulse Pro</i>\s*(?:⚡\s*Market Pulse Pro)?",
-        "",
-        t,
-    )
+    patterns = [
+        r"(?is)<i>\s*Illustrative only\..*?</i>\s*(?:\u26a1|⚡)?\s*Market Pulse Pro\s*",
+        r"(?is)Illustrative only\.\s*Not financial advice\..*?NFA\s*[—\-]\s*DYOR.*?(?:\u26a1|⚡)?\s*Market Pulse Pro\s*",
+        r"(?is)<i>NFA\s*[—\-]\s*manage your risk\.?\s*[·.]?\s*(?:\u26a1|⚡)?\s*Market Pulse Pro</i>\s*",
+        r"(?is)NFA\s*[—\-]\s*manage your risk\.?\s*[·.]?\s*(?:\u26a1|⚡)\s*Market Pulse Pro\s*",
+        r"(?m)^(?:\u26a1|⚡)\s*Market Pulse Pro\s*$",
+    ]
+    for pat in patterns:
+        t = _re.sub(pat, "", t)
+    t = _re.sub(r"(?:(?:\u26a1|⚡)\s*Market Pulse Pro\s*){2,}", "⚡ Market Pulse Pro\n", t)
     t = _re.sub(r"(?m)^[\u2501\u2500━─\-=]{5,}\s*$", "", t)
     t = _re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()

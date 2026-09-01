@@ -21,6 +21,7 @@ import threading
 from logging.handlers import RotatingFileHandler
 
 from market_pulse.ai_engine import ask_ai
+from market_pulse.message_integrity import strip_spurious_naira_from_crypto_text
 from market_pulse.ai_narrative_guard import (
     sanitize_ai_narrative, append_narrative_rules,
     lock_levels_and_confidence_in_text, neutral_p2p_context,
@@ -367,6 +368,7 @@ def build_morning_briefing_pro():
     ai, _ = ask_ai(append_narrative_rules(ai_prompt))
     if ai:
         ai = sanitize_ai_narrative(ai, fallback=ai)
+        ai = strip_spurious_naira_from_crypto_text(ai)
     if not ai:
         ai = "Markets are setting up. Watch key levels and size your positions correctly."
     # Lock Entry/Stop/Target/Confidence to signal engine when available
@@ -530,6 +532,7 @@ def build_midday_snapshot_pro():
     ai, _ = ask_ai(append_narrative_rules(ai_prompt))
     if ai:
         ai = sanitize_ai_narrative(ai, fallback=ai)
+        ai = strip_spurious_naira_from_crypto_text(ai)
     if not ai:
         ai = "Market consolidating. Wait for a directional close before committing."
 
@@ -683,6 +686,7 @@ def build_evening_recap_pro():
     ai, _ = ask_ai(append_narrative_rules(ai_prompt))
     if ai:
         ai = sanitize_ai_narrative(ai, fallback=ai)
+        ai = strip_spurious_naira_from_crypto_text(ai)
     if not ai:
         ai = "Markets closed with mixed signals. Stay patient and wait for cleaner setups."
 
@@ -821,6 +825,7 @@ def build_weekly_edge_pro():
     ai, _ = ask_ai(append_narrative_rules(ai_prompt))
     if ai:
         ai = sanitize_ai_narrative(ai, fallback=ai)
+        ai = strip_spurious_naira_from_crypto_text(ai)
     if not ai:
         # Fallback template — also grounded in the real technical data, not
         # an invented number. This used to compute a fake entry as

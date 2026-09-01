@@ -15,6 +15,7 @@ from datetime import timedelta
 from market_pulse.config_runtime import logger
 from market_pulse.db import get_db
 from market_pulse.alerts import _calc_trade_metrics
+from market_pulse.message_integrity import classify_vs_active_open
 from market_pulse.edge_trade_engine import (
     _gather_trade_analytics,
     _tier_conditions_met,
@@ -665,6 +666,45 @@ def run_trade_scanner():
                 MAX_TRADES_PER_DAY_HARD,
             )
             continue
+
+
+        # Active thesis / similar open setup suppression
+        try:
+            entry_v = None
+            tr = item.get("trade") or {}
+            if tr.get("entry") is not None:
+                try:
+                    entry_v = float(tr.get("entry"))
+                except Exception:
+                    entry_v = None
+            tf = (tr.get("timeframe") if isinstance(tr, dict) else None) or item.get("timeframe") or ""
+            cls, exist_id = classify_vs_active_open(
+                item.get("identifier") or item.get("coin") or "",
+                item.get("direction") or (tr.get("direction") if isinstance(tr, dict) else "") or "",
+                tf,
+                entry_v or 0.0,
+            )
+            if cls == "SIMILAR_ACTIVE_SETUP" and exist_id and exist_id != item.get("idea_id"):
+                record_candidate(
+                    scan_run_id,
+                    item["identifier"],
+                    item["tier"],
+                    "SUPPRESSED",
+                    rejection_reason=f"SIMILAR_ACTIVE_SETUP:{exist_id}",
+                    direction=item.get("direction"),
+                    idea_id=item.get("idea_id"),
+                    score=score,
+                )
+                mark_trade_publication(
+                    item.get("idea_id"), "SUPPRESSED", f"SIMILAR_ACTIVE_SETUP:{exist_id}"
+                )
+                logger.info(
+                    "[SCANNER] SUPPRESSED %s %s — similar to open #%s",
+                    item["identifier"], item["tier"], exist_id,
+                )
+                continue
+        except Exception as _sim_e:
+            logger.debug("[SCANNER] similar check: %s", _sim_e)
 
         is_overflow = projected_today >= MAX_TRADES_PER_DAY
 

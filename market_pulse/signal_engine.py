@@ -214,22 +214,38 @@ def analyze(candles, symbol="", min_candles=60):
         if dist_pct < 1.0:
             risks.append(f"Support at {s['price']:.4g} is only {dist_pct:.2f}% away — limited room before a likely reaction")
 
-    # ── Pattern recognition ──
+    # ── Pattern recognition (direction-aligned; resolve contradictions) ──
     candle_hits = detect_candlestick_patterns(candles)
     chart_hits = detect_all_chart_patterns(candles)
-    pattern_ok = False
-    if direction == "long" and (any(p in BULLISH_CANDLES for p in candle_hits) or
-                                 any(p in BULLISH_CHART_PATTERNS for p in chart_hits)):
-        pattern_ok = True
-    if direction == "short" and (any(p in BEARISH_CANDLES for p in candle_hits) or
-                                  any(p in BEARISH_CHART_PATTERNS for p in chart_hits)):
-        pattern_ok = True
-    confirmations.append(_confirm("pattern_confirms", pattern_ok,
-                                   {"candles": candle_hits, "chart": list(chart_hits.keys())}))
+    chart_names = list(chart_hits.keys()) if isinstance(chart_hits, dict) else list(chart_hits or [])
+    bull_charts = [p for p in chart_names if p in BULLISH_CHART_PATTERNS]
+    bear_charts = [p for p in chart_names if p in BEARISH_CHART_PATTERNS]
+    if bull_charts and bear_charts:
+        risks.append(
+            "Conflicting chart patterns detected ("
+            + ", ".join(bull_charts + bear_charts)
+            + ") — not counted as confirmation"
+        )
+        aligned_charts = []
+    elif direction == "long":
+        aligned_charts = bull_charts
+    else:
+        aligned_charts = bear_charts
+    if direction == "long":
+        aligned_candles = [p for p in candle_hits if p in BULLISH_CANDLES]
+    else:
+        aligned_candles = [p for p in candle_hits if p in BEARISH_CANDLES]
+    pattern_ok = bool(aligned_candles or aligned_charts)
+    confirmations.append(_confirm(
+        "pattern_confirms", pattern_ok,
+        {
+            "candles": aligned_candles,
+            "chart": aligned_charts,
+            "ignored_conflict": bool(bull_charts and bear_charts),
+        },
+    ))
     if pattern_ok:
-        hit_names = [p for p in candle_hits if p in (BULLISH_CANDLES | BEARISH_CANDLES)] + \
-                    [p for p in chart_hits if p in (BULLISH_CHART_PATTERNS | BEARISH_CHART_PATTERNS)]
-        reasons.append(f"Pattern confirmation: {', '.join(hit_names)}")
+        reasons.append("Pattern confirmation: " + ", ".join(aligned_candles + aligned_charts))
 
     flag = chart_hits.get("flag_or_pennant")
     explosive_setup = bool(flag) or (breakout_ok and not breakout.get("close_confirmed", True))
