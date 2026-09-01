@@ -16,6 +16,13 @@ from market_pulse.config_runtime import logger
 from market_pulse.db import get_db
 from market_pulse.alerts import _calc_trade_metrics
 from market_pulse.message_integrity import classify_vs_active_open
+from market_pulse.blueprint_v31 import (
+    assess_crypto_price_quality,
+    final_price_check,
+    STATUS_SKIPPED_DATA_QUALITY,
+    STATUS_EXPIRED_BEFORE_PUBLISH,
+    BLUEPRINT_VERSION,
+)
 from market_pulse.edge_trade_engine import (
     _gather_trade_analytics,
     _tier_conditions_met,
@@ -361,6 +368,7 @@ def run_trade_scanner():
         TRADE_SCAN_INTERVAL_SEC,
     )
     scan_run_id = start_scan_run()
+    logger.info("[SCANNER] Blueprint v%s scan_run=%s", BLUEPRINT_VERSION, scan_run_id)
     markets_touched = 0
     scan_errors = 0
 
@@ -381,6 +389,16 @@ def run_trade_scanner():
                         rejection_reason="PRICE_UNAVAILABLE",
                     )
                     continue
+                dq, dq_reason = assess_crypto_price_quality(coin, price)
+                if dq == "BLOCKED":
+                    record_candidate(
+                        scan_run_id, coin, tier, "REJECTED",
+                        rejection_reason=STATUS_SKIPPED_DATA_QUALITY,
+                    )
+                    logger.info("[SCANNER] %s %s SKIPPED_DATA_QUALITY (%s)", coin, tier, dq_reason)
+                    continue
+                if dq == "DEGRADED":
+                    logger.debug("[SCANNER] %s data degraded: %s", coin, dq_reason)
                 analytics = _gather_trade_analytics(coin, price)
                 ok, reason = _tier_conditions_met(tier, analytics, fg_val)
                 if ok:
@@ -707,6 +725,41 @@ def run_trade_scanner():
             logger.debug("[SCANNER] similar check: %s", _sim_e)
 
         is_overflow = projected_today >= MAX_TRADES_PER_DAY
+
+        # v3.1 final price check — expire before publish if entry already ran away
+        try:
+            tr = item.get("trade") or {}
+            ent = tr.get("entry")
+            try:
+                ent_f = float(ent) if ent is not None else 0.0
+            except Exception:
+                ent_f = 0.0
+            ident = item.get("identifier") or ""
+            if item.get("asset_type") == "crypto" and ent_f > 0:
+                ok_px, px_reason, _live = final_price_check(
+                    ident, ent_f, item.get("direction") or tr.get("direction") or ""
+                )
+                if not ok_px:
+                    record_candidate(
+                        scan_run_id,
+                        item["identifier"],
+                        item["tier"],
+                        "SUPPRESSED",
+                        rejection_reason=STATUS_EXPIRED_BEFORE_PUBLISH,
+                        direction=item.get("direction"),
+                        idea_id=item.get("idea_id"),
+                        score=score,
+                    )
+                    mark_trade_publication(
+                        item.get("idea_id"), "SUPPRESSED", STATUS_EXPIRED_BEFORE_PUBLISH
+                    )
+                    logger.info(
+                        "[SCANNER] EXPIRED_BEFORE_PUBLISH %s %s — %s",
+                        item["identifier"], item["tier"], px_reason,
+                    )
+                    continue
+        except Exception as _fpc:
+            logger.debug("[SCANNER] final price check: %s", _fpc)
 
         try:
             post_to_pro_channel(item["msg"])

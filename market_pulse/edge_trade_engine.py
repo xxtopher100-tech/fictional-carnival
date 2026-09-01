@@ -272,9 +272,12 @@ def _tier_conditions_met(tier, analytics, fg_val):
             return False, f"NORMAL: RSI {rsi:.0f} too extreme even for default tier"
         return True, "NORMAL pre-screen ok"
 
-    # ── AGGRESSIVE (edge) ───────────────────────────────────────────────
-    # Own test only — not ranked above/below other tiers by the scanner.
+    # ── AGGRESSIVE (edge) — v3.1: NORMAL quality floor + specific additional edge ──
+    # EDGE must never mean a weaker setup than NORMAL.
     if tier == "edge":
+        ok_n, reason_n = _tier_conditions_met("momentum", analytics, fg_val)
+        if not ok_n:
+            return False, f"EDGE blocked by NORMAL floor: {reason_n}"
         has_catalyst = False
         if rsi is not None and (rsi >= 65 or rsi <= 35):
             has_catalyst = True
@@ -285,8 +288,8 @@ def _tier_conditions_met(tier, analytics, fg_val):
         if vol_trend == "rising":
             has_catalyst = True
         if not has_catalyst:
-            return False, "AGGRESSIVE: no catalyst (extension/extreme/F&G/vol) — no forced edge"
-        return True, "AGGRESSIVE pre-screen ok"
+            return False, "EDGE: no additional catalyst (extension/extreme/F&G/vol)"
+        return True, "EDGE pre-screen ok (NORMAL floor + catalyst)"
 
     return True, "ok"
 
