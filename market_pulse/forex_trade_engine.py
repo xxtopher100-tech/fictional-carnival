@@ -16,7 +16,10 @@ import threading
 import time
 
 from market_pulse.ai_engine import ask_ai
-from market_pulse.ai_narrative_guard import sanitize_ai_narrative, append_narrative_rules
+from market_pulse.ai_narrative_guard import (
+    sanitize_ai_narrative, append_narrative_rules,
+    format_level_for_prompt, lock_levels_and_confidence_in_text,
+)
 from market_pulse.config_runtime import logger
 from market_pulse.db import get_db
 from market_pulse.edge_trade_engine import EDGE_DISCLAIMER, STANDARD_DISCLAIMER, TRADE_TIERS, mark_trade_publication
@@ -235,10 +238,7 @@ def _build_forex_ai_prompt(pair_key, rate, bid, ask, tier, fg_val, source):
         "edge": "1H or 4H. High-conviction only.",
     }
     ngn_context = ""
-    if "NGN" in pair_key:
-        ngn_context = (
-            "\nNIGERIAN CONTEXT: Consider naira pressure, parallel market, and P2P liquidity."
-        )
+    # NGN pairs are not trade setups; never invite causal naira narratives.
     return (
         f"You are a forex analyst for Nigerian traders on Market Pulse Pro.\n\n"
         f"PAIR: {pair_key} — {pair['description']}\n"
@@ -487,9 +487,9 @@ def generate_forex_trade_idea(pair_key, tier="momentum"):
             try:
                 prompt = (
                     f"{pair_key} {tier} levels already set by rules.\n"
-                    f"Entry {trade['entry']} Stop {trade['stop']} TP1 {trade['target1']}\n"
-                    f"Direction {trade['direction']}. Source {source}.\n"
-                    f"Write 2 short technical sentences about the levels only. No invented causality. Do NOT change numbers."
+                    f"Entry {format_level_for_prompt(trade['entry'])} Stop {format_level_for_prompt(trade['stop'])} TP1 {format_level_for_prompt(trade['target1'])}\n"
+                    f"Direction {trade['direction']}. Confidence {trade.get('confidence') or 'Moderate'}. Source {source}.\n"
+                    f"Write 2 short technical sentences about the levels only. Use only the Entry/Stop/TP1/Confidence above. No invented numbers, Confidence, or naira causality."
                 )
                 ai_raw, _ = ask_ai(append_narrative_rules(prompt))
                 if ai_raw:
@@ -516,6 +516,24 @@ def generate_forex_trade_idea(pair_key, tier="momentum"):
         if not valid:
             logger.warning("[FOREX ENGINE] %s %s validation failed: %s", pair_key, tier, reason)
             return None, None, 0
+
+        # Single source of truth — AI must not override deterministic confidence
+        if trade.get("source") == "forex_programmatic":
+            trade["confidence"] = "Moderate"
+        else:
+            trade["confidence"] = trade.get("confidence") or "Moderate"
+        if trade.get("rationale"):
+            trade["rationale"] = lock_levels_and_confidence_in_text(
+                sanitize_ai_narrative(trade["rationale"], fallback=trade["rationale"]),
+                entry=trade.get("entry"), stop=trade.get("stop"),
+                target=trade.get("target1"),
+                confidence=trade.get("confidence") or "Moderate",
+            )
+        if trade.get("ng_angle"):
+            trade["ng_angle"] = sanitize_ai_narrative(
+                trade["ng_angle"],
+                fallback="Size small; confirm live P2P quotes before converting naira.",
+            )
 
         idea_id = 0
         db = None

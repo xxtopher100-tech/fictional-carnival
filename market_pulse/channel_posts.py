@@ -21,7 +21,10 @@ import threading
 from logging.handlers import RotatingFileHandler
 
 from market_pulse.ai_engine import ask_ai
-from market_pulse.ai_narrative_guard import sanitize_ai_narrative, append_narrative_rules
+from market_pulse.ai_narrative_guard import (
+    sanitize_ai_narrative, append_narrative_rules,
+    lock_levels_and_confidence_in_text, neutral_p2p_context,
+)
 from market_pulse.alert_formatter import build_alert_message, build_no_signal_message
 from market_pulse.candle_engine import candles_ready, get_candles
 from market_pulse.config_runtime import logger
@@ -359,13 +362,35 @@ def build_morning_briefing_pro():
         f"DECISION: base any Entry, Stop, Target STRICTLY on the REAL TECHNICAL DATA above — "
         f"never invent price levels that contradict or go beyond what it states. "
         f"If it says no confirmed setup, say so plainly instead of forcing a trade idea. "
-        f"Also say whether the P2P spread makes it worth converting naira right now."
+        f"CONTEXT: only restate P2P numbers/status if provided. No naira causality or invented % loss."
     )
     ai, _ = ask_ai(append_narrative_rules(ai_prompt))
     if ai:
         ai = sanitize_ai_narrative(ai, fallback=ai)
     if not ai:
         ai = "Markets are setting up. Watch key levels and size your positions correctly."
+    # Lock Entry/Stop/Target/Confidence to signal engine when available
+    if ai and btc_signal_result:
+        try:
+            conf_pct = btc_signal_result.get("confidence")
+            conf_label = "Moderate"
+            if conf_pct is not None:
+                try:
+                    cp = float(conf_pct)
+                    conf_label = "High" if cp >= 70 else ("Moderate" if cp >= 45 else "Low")
+                except Exception:
+                    conf_label = str(conf_pct)
+            tps = btc_signal_result.get("take_profit") or []
+            t1 = tps[0] if tps else None
+            ai = lock_levels_and_confidence_in_text(
+                ai,
+                entry=btc_signal_result.get("entry"),
+                stop=btc_signal_result.get("stop_loss") or btc_signal_result.get("stop"),
+                target=t1,
+                confidence=conf_label,
+            )
+        except Exception as _le:
+            logger.debug("[MORNING AI] level lock: %s", _le)
 
     import re as _re
     em = _re.search(r"Entry[:\s]+([$\u20a60-9,.kK]+)", ai, _re.IGNORECASE)
