@@ -27,15 +27,23 @@ from logging.handlers import RotatingFileHandler
 # ═══════════════════════════════════════════════════════════════════════════
 
 LOG_FILE = "bot.log"
+# INFO → stdout so Railway does not treat normal logs as errors (stderr).
+import sys as _sys
+_handlers = [
+    RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=5),
+    logging.StreamHandler(_sys.stdout),
+]
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=5),
-        logging.StreamHandler()
-    ]
+    handlers=_handlers,
+    force=True,
 )
 logger = logging.getLogger(__name__)
+# Keep WARNING+ on stderr for real problems
+_err = logging.StreamHandler(_sys.stderr)
+_err.setLevel(logging.WARNING)
+logger.addHandler(_err)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 🔑 TOKEN CONFIGURATION
@@ -69,6 +77,37 @@ CHANNEL_ENABLED = True
 MIRROR_MODE = False  # When True: Pro channel content also posts to free channel
 WAT_OFFSET = 1
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+
+def validate_critical_config() -> list:
+    """Return list of missing/invalid critical env vars. Empty = OK to start."""
+    missing = []
+    tok = (BOT_TOKEN or "").strip()
+    if not tok or tok.startswith("YOUR_") or "TOKEN_HERE" in tok:
+        missing.append("BOT_TOKEN")
+    db = (DATABASE_URL or "").strip()
+    if not db or not (db.startswith("postgres://") or db.startswith("postgresql://")):
+        missing.append("DATABASE_URL")
+    return missing
+
+
+def config_status_summary() -> dict:
+    """Safe non-secret status for admin diagnostics (no secret values)."""
+    return {
+        "bot_token_set": bool(BOT_TOKEN) and not str(BOT_TOKEN).startswith("YOUR_"),
+        "database_url_set": bool(DATABASE_URL) and (
+            DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+        ),
+        "admin_ids_count": len(ADMIN_IDS),
+        "channel_id_set": bool(CHANNEL_ID),
+        "pro_channel_id_set": bool(PRO_CHANNEL_ID),
+        "shadow_verify": SHADOW_VERIFY_ENABLED,
+        "ai_keys_configured": sum(
+            1
+            for k in (DEEPSEEK_KEY, MISTRAL_KEY, QWEN_KEY)
+            if k and not str(k).startswith("YOUR_")
+        ),
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 🔁 SHARED CHANNEL / MIRROR STATE ACCESSORS

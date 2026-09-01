@@ -29,6 +29,7 @@ from market_pulse.channel_posts import build_evening_recap, build_evening_recap_
 from market_pulse.config_runtime import (
     ADMIN_IDS, BOT_TOKEN, COINS, LOG_FILE, P2P_FIATS, SCHEDULE, load_admin_config, logger, save_admin_config,
     get_channel_enabled, set_channel_enabled, get_pro_channel_id, set_pro_channel_id, get_mirror_mode, set_mirror_mode,
+    validate_critical_config, config_status_summary,
 )
 from market_pulse.content_engine import build_admin_dashboard, build_weekly_educational_content, format_content_package_for_admin, generate_and_deliver_content_package, get_content_package_by_id, get_pending_content_packages, mark_package_status
 from market_pulse.db import get_db, init_db
@@ -390,6 +391,16 @@ _secondary_cache = {"data": {}, "timestamp": None}
 
 def run():
     global BOT_MODE, CHANNEL_ID, _kraken_cache, _secondary_cache, _morning_btc_snapshot
+
+    missing = validate_critical_config()
+    if missing:
+        logger.error(
+            "[STARTUP] Critical configuration missing/invalid: %s — "
+            "set these Railway Variables and redeploy.",
+            ", ".join(missing),
+        )
+        raise SystemExit(f"Missing critical env: {', '.join(missing)}")
+    logger.info("[STARTUP] Critical config OK (BOT_TOKEN + DATABASE_URL present)")
     
     # Load admin config on startup
     config = load_admin_config()
@@ -1151,6 +1162,15 @@ def run():
                             continue
 
                         # ── HEALTH ──────────────────────────────────────────────────
+                        if text.startswith("/opsreport") or text.startswith("/ops"):
+                            try:
+                                from market_pulse.trade_engine_report import build_ops_diagnostic_report
+                                send(chat_id, build_ops_diagnostic_report())
+                            except Exception as _oe:
+                                logger.error("[OPS REPORT] %s", _oe)
+                                send(chat_id, f"❌ Ops report failed: {_oe}")
+                            continue
+
                         if text.startswith("/health"):
                             send(chat_id, "🔍 Running health check...")
                             checks = []

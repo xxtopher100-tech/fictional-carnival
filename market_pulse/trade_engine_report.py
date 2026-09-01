@@ -50,6 +50,20 @@ def _ensure_report_schema():
             )
             """
         )
+        # Observability indexes (idempotent)
+        for stmt in (
+            "CREATE INDEX IF NOT EXISTS idx_scan_cand_run ON trade_scan_candidates(scan_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_scan_cand_status ON trade_scan_candidates(status)",
+            "CREATE INDEX IF NOT EXISTS idx_scan_cand_idea ON trade_scan_candidates(idea_id)",
+            "CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON trade_scan_runs(started_at)",
+        ):
+            try:
+                c.execute(stmt)
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
         db.commit()
     except Exception as e:
         logger.warning("[ENGINE REPORT] schema: %s", e)
@@ -406,3 +420,110 @@ def send_daily_engine_report(force: bool = False) -> bool:
                 db.close()
             except Exception:
                 pass
+
+
+def build_ops_diagnostic_report() -> str:
+    """Admin-only ops summary. No secrets. Engineering health + last scan funnel."""
+    lines = ["<b>SYSTEM / OPS REPORT</b>", "<i>Engineering status — not performance advice</i>", ""]
+    # Config (no secret values)
+    try:
+        from market_pulse.config_runtime import config_status_summary
+        cs = config_status_summary()
+        lines += [
+            "<b>CONFIG</b>",
+            f"BOT_TOKEN set: {'yes' if cs.get('bot_token_set') else 'NO'}",
+            f"DATABASE_URL set: {'yes' if cs.get('database_url_set') else 'NO'}",
+            f"ADMIN_IDS: {cs.get('admin_ids_count', 0)}",
+            f"Free channel ID: {'yes' if cs.get('channel_id_set') else 'no'}",
+            f"Pro channel ID: {'yes' if cs.get('pro_channel_id_set') else 'no'}",
+            f"Shadow verify: {'on' if cs.get('shadow_verify') else 'off'}",
+            f"AI keys configured: {cs.get('ai_keys_configured', 0)}/3",
+            "",
+        ]
+    except Exception as e:
+        lines += [f"CONFIG: error ({e})", ""]
+
+    # DB ping
+    db = None
+    try:
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT 1")
+        lines += ["Database: <b>OK</b>"]
+    except Exception as e:
+        lines += [f"Database: <b>FAIL</b> ({e})"]
+        return "\n".join(lines)
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    # Last scan
+    db = None
+    try:
+        db = get_db()
+        c = db.cursor()
+        c.execute(
+            """
+            SELECT id, started_at, completed_at, status, markets_scanned,
+                   candidates_detected, qualified_count, published_count, error_count
+            FROM trade_scan_runs
+            ORDER BY id DESC LIMIT 1
+            """
+        )
+        row = c.fetchone()
+        if not row:
+            lines += ["", "<b>LAST SCAN</b>", "No scan runs recorded yet."]
+        else:
+            (
+                sid, started, completed, status, markets,
+                detected, qualified, published, errors,
+            ) = row
+            lines += [
+                "",
+                "<b>LAST SCAN</b>",
+                f"Scan ID: <code>{sid}</code>",
+                f"Started: {started}",
+                f"Completed: {completed or '—'}",
+                f"Status: {status}",
+                f"Markets: {markets}",
+                f"Candidates: {detected}",
+                f"Qualified: {qualified}",
+                f"Published: {published}",
+                f"Errors: {errors}",
+            ]
+            c.execute(
+                """
+                SELECT COALESCE(rejection_reason,'?'), COUNT(*)
+                FROM trade_scan_candidates
+                WHERE scan_run_id=%s AND status IN ('REJECTED','SUPPRESSED','FILTERED')
+                GROUP BY 1 ORDER BY 2 DESC LIMIT 8
+                """,
+                (sid,),
+            )
+            reasons = c.fetchall() or []
+            if reasons:
+                lines += ["", "<b>TOP REJECTION / SUPPRESS REASONS</b>"]
+                for reason, cnt in reasons:
+                    lines.append(f"· {reason}: {cnt}")
+    except Exception as e:
+        lines += ["", f"LAST SCAN: unavailable ({e})"]
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    # Engines (best-effort)
+    try:
+        from market_pulse.price_engine import ws_engine_status
+        st = ws_engine_status() or {}
+        lines += ["", "<b>WEBSOCKET</b>", f"Status: {st}"]
+    except Exception as e:
+        lines += ["", f"WEBSOCKET: {e}"]
+
+    lines += ["", "<i>NFA — ops only</i>"]
+    return "\n".join(lines)
