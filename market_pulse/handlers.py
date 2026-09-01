@@ -1171,6 +1171,39 @@ def run():
                                 send(chat_id, f"❌ Ops report failed: {_oe}")
                             continue
 
+                        if text.startswith("/forceoutcomes"):
+                            try:
+                                from market_pulse.outcome_monitor import run_outcome_cycle, monitor_open_trades
+                                from market_pulse.config_runtime import ADMIN_IDS as _AIDS
+                                send(chat_id, "⏳ Running outcome cycle now…")
+                                if not _AIDS:
+                                    send(
+                                        chat_id,
+                                        "⚠️ <b>ADMIN_IDS is empty</b> on Railway.\n"
+                                        "Outcomes cannot DM anyone. Set ADMIN_IDS to your Telegram user id.",
+                                    )
+                                ev = monitor_open_trades(limit=80)
+                                if not ev:
+                                    send(
+                                        chat_id,
+                                        "✅ Cycle finished.\n"
+                                        "No new TP/SL/expiry transitions.\n"
+                                        "Check Railway logs for <code>[OUTCOME] cycle:</code>",
+                                    )
+                                else:
+                                    lines = ["✅ <b>Outcome events</b>"]
+                                    for e in ev[:25]:
+                                        lines.append(
+                                            f"#{e.get('id')} → {e.get('state')} "
+                                            f"{'(historical)' if e.get('historical') else ''} "
+                                            f"{'(backfill)' if e.get('backfill') else ''}"
+                                        )
+                                    send(chat_id, "\n".join(lines))
+                            except Exception as _fe:
+                                logger.error("[FORCE OUTCOMES] %s", _fe)
+                                send(chat_id, f"❌ Force outcomes failed: {_fe}")
+                            continue
+
                         if text.startswith("/health"):
                             send(chat_id, "🔍 Running health check...")
                             checks = []

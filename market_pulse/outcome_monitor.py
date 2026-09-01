@@ -34,6 +34,8 @@ _TRADE_COLS = [
     ("mae", "TEXT"),
     ("last_notified_state", "TEXT"),
     ("outcome_detail", "TEXT"),
+    ("publication_status", "TEXT"),
+    ("publication_reason", "TEXT"),
 ]
 
 
@@ -138,14 +140,21 @@ def get_or_set_monitor_activation_cutoff():
 
 
 def is_historical_trade(created_at, cutoff_str) -> bool:
-    if not created_at or not cutoff_str:
-        return True
+    """True only when we can prove the trade predates the monitor activation cutoff.
+
+    Missing cutoff / bad timestamps must NOT suppress Telegram (previous bug:
+    empty cutoff → every trade treated as historical → zero outcome DMs).
+    """
+    if not cutoff_str:
+        return False
+    if not created_at:
+        return False
     try:
         c = datetime.strptime(str(created_at)[:19], "%Y-%m-%d %H:%M:%S")
         k = datetime.strptime(str(cutoff_str)[:19], "%Y-%m-%d %H:%M:%S")
         return c < k
     except Exception:
-        return True
+        return False
 
 
 def _notify_admins(text: str):
@@ -220,6 +229,12 @@ def monitor_open_trades(limit: int = 40) -> list:
         rows = c.fetchall() or []
         now = wat_now()
         now_s = now.strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(
+            "[OUTCOME] cycle: %s trade row(s) to evaluate (open + un-notified closed)",
+            len(rows),
+        )
+        if not rows:
+            logger.info("[OUTCOME] cycle: no open/un-notified trades in ledger")
 
         for row in rows:
             try:
@@ -255,6 +270,13 @@ def monitor_open_trades(limit: int = 40) -> list:
             db.commit()
         except Exception:
             pass
+        if events:
+            logger.info(
+                "[OUTCOME] cycle events: %s",
+                ", ".join(f"#{e.get('id')}:{e.get('state')}" for e in events[:20]),
+            )
+        else:
+            logger.info("[OUTCOME] cycle: no terminal transitions this run")
     except Exception as e:
         logger.error("[OUTCOME] monitor: %s", e)
     finally:
