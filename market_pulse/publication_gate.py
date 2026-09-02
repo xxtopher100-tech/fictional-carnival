@@ -6,6 +6,8 @@ Does not change entry/stop/TP math.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import time
 from typing import Any, Optional, Tuple
@@ -312,6 +314,211 @@ def try_claim_idempotency(idea_id: int, idem_key: str) -> bool:
                 pass
 
 
+# Burst spacing — NOT a daily quota. Configurable via Railway env.
+NORMAL_PUBLICATION_COOLDOWN_SECONDS = int(
+    os.environ.get("NORMAL_PUBLICATION_COOLDOWN_SECONDS", "600")
+)
+_LAST_PUB_KEY = "pub_gate_last_publish_ts"
+
+
+def get_publication_cooldown_sec() -> int:
+    return max(0, int(NORMAL_PUBLICATION_COOLDOWN_SECONDS))
+
+
+def _get_last_publish_ts() -> float:
+    if not get_db:
+        return 0.0
+    db = None
+    try:
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT value FROM admin_settings WHERE key=%s", (_LAST_PUB_KEY,))
+        row = c.fetchone()
+        if not row or row[0] is None:
+            return 0.0
+        return float(row[0])
+    except Exception:
+        return 0.0
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _set_last_publish_ts(ts: Optional[float] = None) -> None:
+    if not get_db:
+        return
+    db = None
+    try:
+        db = get_db()
+        c = db.cursor()
+        val = str(float(ts if ts is not None else time.time()))
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        c.execute(
+            "INSERT INTO admin_settings (key, value, updated_at) VALUES (%s,%s,%s) "
+            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at",
+            (_LAST_PUB_KEY, val, now),
+        )
+        db.commit()
+    except Exception as e:
+        logger.debug("[PUB GATE] set last pub ts: %s", e)
+        if db:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _ensure_queue_schema(c) -> None:
+    try:
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_publish_queue (
+                id SERIAL PRIMARY KEY,
+                idea_id INTEGER NOT NULL,
+                msg TEXT NOT NULL,
+                payload TEXT,
+                ready_at DOUBLE PRECISION NOT NULL,
+                status TEXT DEFAULT 'QUEUED',
+                created_at TEXT,
+                UNIQUE(idea_id)
+            )
+            """
+        )
+    except Exception:
+        pass
+
+
+def enqueue_publication(
+    *,
+    msg: str,
+    idea_id: int,
+    symbol: str,
+    direction: str,
+    timeframe: str = "",
+    entry: Any = None,
+    stop: Any = None,
+    target1: Any = None,
+    market_type: str = "crypto",
+    tier: str = "",
+    source: str = "scanner",
+    delay_sec: Optional[int] = None,
+) -> bool:
+    """Persist a qualified trade for later publish (survives restart)."""
+    if not get_db or not idea_id or not msg:
+        return False
+    delay = int(delay_sec if delay_sec is not None else get_publication_cooldown_sec())
+    ready = time.time() + max(1, delay)
+    payload = {
+        "symbol": symbol,
+        "direction": direction,
+        "timeframe": timeframe,
+        "entry": entry,
+        "stop": stop,
+        "target1": target1,
+        "market_type": market_type,
+        "tier": tier,
+        "source": source,
+    }
+    db = None
+    try:
+        db = get_db()
+        c = db.cursor()
+        _ensure_queue_schema(c)
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        c.execute(
+            """
+            INSERT INTO trade_publish_queue (idea_id, msg, payload, ready_at, status, created_at)
+            VALUES (%s,%s,%s,%s,'QUEUED',%s)
+            ON CONFLICT (idea_id) DO UPDATE SET
+                msg = EXCLUDED.msg,
+                payload = EXCLUDED.payload,
+                ready_at = LEAST(trade_publish_queue.ready_at, EXCLUDED.ready_at),
+                status = 'QUEUED'
+            """,
+            (int(idea_id), msg, json.dumps(payload), ready, now),
+        )
+        db.commit()
+        try:
+            from market_pulse.edge_trade_engine import mark_trade_publication
+            mark_trade_publication(idea_id, "TEMPORARILY_QUEUED", f"BURST_COOLDOWN:{delay}s")
+        except Exception:
+            pass
+        logger.info(
+            "[PUB GATE] QUEUED #%s %s ready_in=%ss source=%s",
+            idea_id, symbol, delay, source,
+        )
+        return True
+    except Exception as e:
+        logger.warning("[PUB GATE] enqueue failed #%s: %s", idea_id, e)
+        if db:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        return False
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _post_body(msg: str, idea_id: int, market_type: str) -> str:
+    pub_id = public_signal_id(int(idea_id), market_type)
+    body = msg
+    if pub_id not in body:
+        body = f"<b>{pub_id}</b>\n" + body
+    return body
+
+
+def _do_telegram_publish(
+    *,
+    msg: str,
+    idea_id: int,
+    symbol: str,
+    direction: str,
+    market_type: str,
+    source: str,
+    fp: str,
+) -> Tuple[bool, str]:
+    body = _post_body(msg, idea_id, market_type)
+    try:
+        from market_pulse.telegram_api import post_to_pro_channel
+        post_to_pro_channel(body)
+    except Exception as e:
+        logger.error("[PUB GATE] Telegram failed #%s: %s", idea_id, e)
+        try:
+            from market_pulse.edge_trade_engine import mark_trade_publication
+            mark_trade_publication(idea_id, "PUBLISH_FAILED", str(e)[:120])
+        except Exception:
+            pass
+        return False, "TELEGRAM_ERROR"
+
+    freeze_published_levels(int(idea_id))
+    try:
+        from market_pulse.edge_trade_engine import mark_trade_publication
+        mark_trade_publication(idea_id, "PUBLISHED", f"GATE:{source}")
+    except Exception:
+        pass
+    _set_last_publish_ts(time.time())
+    pub_id = public_signal_id(int(idea_id), market_type)
+    logger.info(
+        "[PUB GATE] PUBLISHED %s #%s %s %s source=%s fp=%s",
+        pub_id, idea_id, symbol, direction, source, fp,
+    )
+    return True, "PUBLISHED"
+
+
 def publish_canonical_trade(
     *,
     msg: str,
@@ -325,10 +532,13 @@ def publish_canonical_trade(
     market_type: str = "crypto",
     tier: str = "",
     source: str = "scanner",
+    skip_burst_queue: bool = False,
 ) -> Tuple[bool, str]:
     """Single publication gate for all paths.
 
     Returns (ok, reason_code).
+    ok=True only when Telegram post succeeded.
+    TEMPORARILY_QUEUED is not a permanent suppress — process_publication_queue drains it.
     """
     if not msg or not idea_id:
         return False, "MISSING_MSG_OR_ID"
@@ -365,40 +575,187 @@ def publish_canonical_trade(
         )
         return False, cls
 
+    # Burst spacing: queue instead of permanent suppress (no daily quota)
+    cooldown = get_publication_cooldown_sec()
+    if not skip_burst_queue and cooldown > 0:
+        last = _get_last_publish_ts()
+        elapsed = time.time() - last if last > 0 else cooldown + 1
+        if last > 0 and elapsed < cooldown:
+            remain = int(cooldown - elapsed)
+            ok_q = enqueue_publication(
+                msg=msg,
+                idea_id=int(idea_id),
+                symbol=symbol,
+                direction=direction,
+                timeframe=timeframe,
+                entry=entry,
+                stop=stop,
+                target1=target1,
+                market_type=market_type,
+                tier=tier,
+                source=source,
+                delay_sec=max(1, remain),
+            )
+            return False, "TEMPORARILY_QUEUED" if ok_q else "QUEUE_FAILED"
+
     idem = f"pub:{fp}:{int(idea_id)}"
     if not try_claim_idempotency(int(idea_id), idem):
         logger.info("[PUB GATE] IDEMPOTENT skip #%s %s", idea_id, symbol)
         return False, "IDEMPOTENT_SKIP"
 
-    # Prefix public id once
-    pub_id = public_signal_id(int(idea_id), market_type)
-    body = msg
-    if pub_id not in body:
-        body = f"<b>{pub_id}</b>\n" + body
+    return _do_telegram_publish(
+        msg=msg,
+        idea_id=int(idea_id),
+        symbol=symbol,
+        direction=direction,
+        market_type=market_type,
+        source=source,
+        fp=fp,
+    )
 
+
+def process_publication_queue(limit: int = 3) -> int:
+    """Drain due queued trades. Re-checks duplicates; respects burst spacing.
+
+    Returns number successfully published this call.
+    """
+    if not get_db:
+        return 0
+    published_n = 0
+    db = None
     try:
-        from market_pulse.telegram_api import post_to_pro_channel
-        post_to_pro_channel(body)
+        db = get_db()
+        c = db.cursor()
+        _ensure_queue_schema(c)
+        now = time.time()
+        c.execute(
+            """
+            SELECT id, idea_id, msg, payload FROM trade_publish_queue
+            WHERE status = 'QUEUED' AND ready_at <= %s
+            ORDER BY ready_at ASC
+            LIMIT %s
+            """,
+            (now, int(limit)),
+        )
+        rows = c.fetchall() or []
     except Exception as e:
-        logger.error("[PUB GATE] Telegram failed #%s: %s", idea_id, e)
+        logger.warning("[PUB GATE] queue read: %s", e)
+        return 0
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    for qid, idea_id, msg, payload_s in rows:
         try:
-            from market_pulse.edge_trade_engine import mark_trade_publication
-            mark_trade_publication(idea_id, "PUBLISH_FAILED", str(e)[:120])
+            payload = json.loads(payload_s or "{}")
+        except Exception:
+            payload = {}
+        symbol = payload.get("symbol") or ""
+        direction = payload.get("direction") or ""
+        timeframe = payload.get("timeframe") or ""
+        entry = payload.get("entry")
+        stop = payload.get("stop")
+        target1 = payload.get("target1")
+        market_type = payload.get("market_type") or "crypto"
+        source = payload.get("source") or "queue"
+
+        # Still within global cooldown? push ready_at forward
+        cooldown = get_publication_cooldown_sec()
+        last = _get_last_publish_ts()
+        if last > 0 and cooldown > 0 and (time.time() - last) < cooldown:
+            remain = cooldown - (time.time() - last)
+            db2 = None
+            try:
+                db2 = get_db()
+                c2 = db2.cursor()
+                c2.execute(
+                    "UPDATE trade_publish_queue SET ready_at=%s WHERE id=%s",
+                    (time.time() + max(1, remain), int(qid)),
+                )
+                db2.commit()
+            except Exception:
+                pass
+            finally:
+                if db2:
+                    try:
+                        db2.close()
+                    except Exception:
+                        pass
+            continue
+
+        # Re-classify before publish
+        cls, exist_id = classify_against_active(
+            market_type=market_type,
+            symbol=symbol,
+            direction=direction,
+            timeframe=timeframe,
+            entry=entry,
+            stop=stop,
+            target1=target1,
+            idea_id=int(idea_id),
+        )
+        if cls in ("DUPLICATE_ACTIVE", "CROSS_TIER_DUPLICATE", "SIMILAR_ACTIVE"):
+            db2 = None
+            try:
+                db2 = get_db()
+                c2 = db2.cursor()
+                c2.execute(
+                    "UPDATE trade_publish_queue SET status='DROPPED' WHERE id=%s",
+                    (int(qid),),
+                )
+                db2.commit()
+                from market_pulse.edge_trade_engine import mark_trade_publication
+                mark_trade_publication(idea_id, "SUPPRESSED", f"QUEUE_{cls}:{exist_id}")
+            except Exception:
+                pass
+            finally:
+                if db2:
+                    try:
+                        db2.close()
+                    except Exception:
+                        pass
+            continue
+
+        ok, code = publish_canonical_trade(
+            msg=msg,
+            idea_id=int(idea_id),
+            symbol=symbol,
+            direction=direction,
+            timeframe=timeframe,
+            entry=entry,
+            stop=stop,
+            target1=target1,
+            market_type=market_type,
+            tier=payload.get("tier") or "",
+            source=f"queue:{source}",
+            skip_burst_queue=True,
+        )
+        db2 = None
+        try:
+            db2 = get_db()
+            c2 = db2.cursor()
+            st = "PUBLISHED" if ok else ("DROPPED" if code != "TELEGRAM_ERROR" else "QUEUED")
+            c2.execute(
+                "UPDATE trade_publish_queue SET status=%s WHERE id=%s",
+                (st, int(qid)),
+            )
+            db2.commit()
         except Exception:
             pass
-        return False, "TELEGRAM_ERROR"
-
-    freeze_published_levels(int(idea_id))
-    try:
-        from market_pulse.edge_trade_engine import mark_trade_publication
-        mark_trade_publication(idea_id, "PUBLISHED", f"GATE:{source}")
-    except Exception:
-        pass
-    logger.info(
-        "[PUB GATE] PUBLISHED %s #%s %s %s source=%s fp=%s",
-        pub_id, idea_id, symbol, direction, source, fp,
-    )
-    return True, "PUBLISHED"
+        finally:
+            if db2:
+                try:
+                    db2.close()
+                except Exception:
+                    pass
+        if ok:
+            published_n += 1
+            # One successful post per cycle respects spacing for the next item
+            break
+    return published_n
 
 
 def ensure_confidence(text: str, confidence: str = "Moderate") -> str:

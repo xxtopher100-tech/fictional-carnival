@@ -61,6 +61,7 @@ from market_pulse.screens import handle_position_calc, show_help, show_main_menu
 from market_pulse.telegram_api import answer_cb, edit, post_to_channel, post_to_pro_channel, send
 from market_pulse.trade_journal import close_trade
 from market_pulse.trade_scanner import run_trade_scanner, get_trade_scan_interval_sec, get_trade_scan_interval_sec
+from market_pulse.publication_gate import process_publication_queue
 from market_pulse.setup_engine import score_open_trade_ideas, outcome_summary
 from market_pulse.outcome_monitor import run_outcome_cycle, send_weekly_report_private
 from market_pulse.trade_engine_report import send_daily_engine_report
@@ -177,6 +178,7 @@ def run():
     last_p2p_check = 0
     last_trade_scan = 0
     last_outcome_score = 0
+    last_pub_queue = 0
     last_p2p_snapshot = 0
     morning_posted = False
     midday_posted = False
@@ -267,6 +269,19 @@ def run():
                     daemon=True
                 ).start()
                 last_trade_scan = now
+
+            # Drain burst-spaced publication queue (qualified trades waiting on cooldown)
+            if now - last_pub_queue >= 60:
+                try:
+                    threading.Thread(
+                        target=process_publication_queue,
+                        kwargs={"limit": 2},
+                        name="PubQueueDrain",
+                        daemon=True,
+                    ).start()
+                except Exception as e:
+                    logger.error("[PUB QUEUE] %s" % e)
+                last_pub_queue = now
 
             # Real-time follow-up (private admin notifications on TP/SL/expiry)
             if now - last_outcome_score >= 300:

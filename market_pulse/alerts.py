@@ -165,14 +165,22 @@ def _zone_gate_allow(prev: dict, in_zone: bool, event_label: str, level) -> tupl
         pass
 
     is_testing = "TESTING" in label
+    is_approaching = "APPROACHING" in label
+    is_reclaim = "RECLAIM" in label
     is_breakout = "BREAKOUT" in label
     is_breakdown = "BELOW" in label or "BREAKDOWN" in label
-    is_transition = is_breakout or is_breakdown or "REJECTION" in label or "INVALID" in label
+    is_transition = (
+        is_breakout
+        or is_breakdown
+        or is_reclaim
+        or "REJECTION" in label
+        or "INVALID" in label
+    )
 
     if not in_zone:
-        # Outside zone — no TESTING spam; leave state update to caller
-        if is_testing:
-            return False, "outside_zone_testing"
+        # Outside zone — no TESTING/APPROACHING spam; leave state update to caller
+        if is_testing or is_approaching:
+            return False, "outside_zone_proximity"
         return False, "outside_zone"
 
     # In zone now
@@ -186,6 +194,14 @@ def _zone_gate_allow(prev: dict, in_zone: bool, event_label: str, level) -> tupl
         if last_event and last_event != label:
             return True, "event_changed_while_in_zone"
         return False, "still_in_zone"
+
+    # APPROACHING: only on new approach after being outside zone (or after different event)
+    if is_approaching:
+        if not was_in:
+            return True, "new_approach"
+        if last_event and last_event != label and "APPROACHING" not in last_event:
+            return True, "approach_after_other_event"
+        return False, "still_approaching_same_zone"
 
     if is_transition:
         if last_event != label:
@@ -500,7 +516,7 @@ def classify_key_alert_tier(coin, price, level, event_label) -> str:
         except Exception:
             pass
         return "SKIP"
-    if "TRADING BELOW" in label or (label.startswith("BELOW") or "BELOW RESISTANCE" in label):
+    if "BREAKDOWN" in label or "TRADING BELOW" in label or (label.startswith("BELOW") or "BELOW RESISTANCE" in label):
         if _15m_level_confirmation(coin, price, level, "TRADING BELOW", fail_open=False):
             return "CONFIRMED"
         try:
@@ -509,11 +525,17 @@ def classify_key_alert_tier(coin, price, level, event_label) -> str:
         except Exception:
             pass
         return "SKIP"
+    # RECLAIM: treat like structural transition — needs 15m interaction
+    if "RECLAIM" in label:
+        if _15m_level_confirmation(coin, price, level, event_label, fail_open=False):
+            return "CONFIRMED"
+        return "EARLY"
     # TESTING: default EARLY (proximity). Upgrade to CONFIRMED only if 15m tagged the level.
     if "TESTING" in label:
         if _15m_level_confirmation(coin, price, level, event_label, fail_open=False):
             return "CONFIRMED"  # confirmed *level test*, still not a trade signal
         return "EARLY"
+    # APPROACHING stays EARLY (watch only — channel posts remain CONFIRMED-only)
     return "EARLY"
 
 # ── Dynamic Key Levels ───────────────────────────────────────────────────
@@ -733,23 +755,37 @@ def _nearest_key_level(price, levels, tolerance=None):
             return level
     return None
 
-def _level_label(price, level):
-    """Correct terminology based on price vs level.
-    Support: a level BELOW current price, approached from above.
-    Resistance: a level ABOVE current price, approached from below.
-    (Previously these two branches were swapped — a level above price was
-    being labeled TESTING SUPPORT, confirmed against real reported alerts
-    where every case had level > price yet was called support.)
+def _level_label(price, level, prev_event: str = ""):
+    """Event-driven label from price vs key level (not a trade signal).
+
+    Support: level BELOW price. Resistance: level ABOVE price.
+    APPROACHING = near but not yet in the tight test band.
+    TESTING = inside proximity zone.
+    BREAKOUT / BREAKDOWN = clear separation through the level.
+    RECLAIM = price recovers a level previously lost (BREAKDOWN) or fails a breakout.
     """
     diff_pct = (price - level) / level * 100
+    prev = (prev_event or "").upper()
+
+    # Reclaim after a prior structural break (requires previous event context)
+    if "BREAKDOWN" in prev or "TRADING BELOW" in prev:
+        if 0 < diff_pct <= 1.5:
+            return "RECLAIM SUPPORT", "🟢"
+    if "BREAKOUT" in prev:
+        if -1.5 <= diff_pct < 0:
+            return "RECLAIM RESISTANCE", "🟠"
+
     if diff_pct > 1.5:
-        return "BREAKOUT", "🚀"                     # price well clear above the level
-    elif diff_pct > 0:
-        return "TESTING SUPPORT", "🟠"               # level is BELOW price -> support test
-    elif diff_pct > -1.5:
-        return "TESTING RESISTANCE", "🟡"            # level is ABOVE price -> resistance test
-    else:
-        return "TRADING BELOW RESISTANCE", "🔴"      # price well clear below a level overhead
+        return "BREAKOUT", "🚀"
+    if 0.45 < diff_pct <= 1.5:
+        return "TESTING SUPPORT", "🟠"
+    if 0 < diff_pct <= 0.45:
+        return "APPROACHING SUPPORT", "🟠"
+    if -0.45 <= diff_pct < 0:
+        return "APPROACHING RESISTANCE", "🟡"
+    if -1.5 <= diff_pct < -0.45:
+        return "TESTING RESISTANCE", "🟡"
+    return "BREAKDOWN", "🔴"
 
 
 def _distance_to_level(price, level):
@@ -1372,7 +1408,10 @@ def check_key_market_alerts():
             level = _nearest_key_level(price, levels)
             if not level:
                 continue
-            event_label, _ = _level_label(price, level)
+            # Load prior zone/event first so RECLAIM can use last_event context
+            prev_zone_probe = _load_zone_state(coin, level, "")
+            prev_evt = (prev_zone_probe or {}).get("last_event") or ""
+            event_label, _ = _level_label(price, level, prev_event=prev_evt)
             in_zone = _price_in_level_zone(price, level)
             # Track exits so a later re-entry can fire TESTING again
             if not in_zone:
@@ -1385,6 +1424,9 @@ def check_key_market_alerts():
             # PRIMARY: zone entry / state transition (restart-safe via admin_settings)
             # TESTING uses per-coin cluster so ETH $2505 and $2509 share state
             prev_zone = _load_zone_state(coin, level, event_label)
+            # Prefer richer previous event for gate if cluster state is empty
+            if not (prev_zone or {}).get("last_event") and prev_evt:
+                prev_zone = dict(prev_zone_probe or {})
             allow, reason = _zone_gate_allow(prev_zone, in_zone, event_label, level)
             if not allow:
                 logger.debug(
