@@ -21,6 +21,7 @@ import threading
 from logging.handlers import RotatingFileHandler
 
 from market_pulse.ai_engine import ask_ai
+from market_pulse.publication_gate import ensure_confidence
 from market_pulse.ai_narrative_guard import sanitize_ai_narrative, append_narrative_rules
 from market_pulse.alerts import (
     _calc_trade_metrics, _validate_alert, _infer_direction,
@@ -136,6 +137,7 @@ def _strip_all_disclaimers(text: str) -> str:
 def _finalize_trade_message(body: str, tier: str) -> str:
     """Body + exactly one disclaimer. Never stacks."""
     clean = _strip_all_disclaimers(body)
+    clean = ensure_confidence(clean, "Moderate")
     disc = EDGE_DISCLAIMER if (tier or "").lower() == "edge" else STANDARD_DISCLAIMER
     return clean.rstrip() + "\n\n" + disc.strip()
 
@@ -560,10 +562,18 @@ def mark_trade_publication(idea_id, status: str, reason: str | None = None) -> b
             c.execute("ALTER TABLE trade_ideas ADD COLUMN IF NOT EXISTS publication_reason TEXT")
         except Exception:
             pass
-        c.execute(
-            "UPDATE trade_ideas SET publication_status=%s, publication_reason=%s WHERE id=%s",
-            (status, reason, int(idea_id)),
-        )
+        # Immutability: once PUBLISHED, do not downgrade status except explicit SUPPRESSED rare ops
+        if status != "PUBLISHED":
+            c.execute(
+                """UPDATE trade_ideas SET publication_status=%s, publication_reason=%s
+                   WHERE id=%s AND COALESCE(publication_status,'') IS DISTINCT FROM 'PUBLISHED'""",
+                (status, reason, int(idea_id)),
+            )
+        else:
+            c.execute(
+                "UPDATE trade_ideas SET publication_status=%s, publication_reason=%s WHERE id=%s",
+                (status, reason, int(idea_id)),
+            )
         db.commit()
         logger.info("[TRADE IDEAS] #%s publication_status=%s reason=%s", idea_id, status, reason)
         return True

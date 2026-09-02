@@ -32,6 +32,7 @@ from market_pulse.helpers import wat_now
 from market_pulse.p2p import get_p2p_rate, format_multi_p2p_intelligence, P2P_ASSETS
 from market_pulse.price_fetchers import get_best_price
 from market_pulse.telegram_api import post_to_pro_channel
+from market_pulse.publication_gate import publish_canonical_trade
 
 
 # ─── extracted section ───
@@ -112,7 +113,23 @@ def run_morning_pro_package():
                     continue
                 msg, trade, idea_id = generate_trade_idea(coin, tier)
                 if msg and idea_id:
-                    post_to_pro_channel(msg)
+                    tr = trade or {}
+                    ok_pub, code = publish_canonical_trade(
+                        msg=msg,
+                        idea_id=int(idea_id),
+                        symbol=coin,
+                        direction=tr.get("direction") or "",
+                        timeframe=tr.get("timeframe") or "",
+                        entry=tr.get("entry"),
+                        stop=tr.get("stop"),
+                        target1=tr.get("target1"),
+                        market_type="crypto",
+                        tier=tier,
+                        source="morning_package",
+                    )
+                    if not ok_pub:
+                        logger.info("[MORNING PRO PKG] GATE %s %s %s", code, coin, tier)
+                        continue
                     crypto_posted += 1
                     posted = True
                     crypto_tier_status[tier] = f"{coin} #{idea_id}"
@@ -142,7 +159,23 @@ def run_morning_pro_package():
                     continue
                 msg, trade, idea_id = generate_forex_trade_idea(pair_key, tier)
                 if msg and idea_id:
-                    post_to_pro_channel(msg)
+                    tr = trade or {}
+                    ok_pub, code = publish_canonical_trade(
+                        msg=msg,
+                        idea_id=int(idea_id),
+                        symbol=pair_key,
+                        direction=tr.get("direction") or "",
+                        timeframe=tr.get("timeframe") or "",
+                        entry=tr.get("entry"),
+                        stop=tr.get("stop"),
+                        target1=tr.get("target1"),
+                        market_type="forex",
+                        tier=tier,
+                        source="morning_package",
+                    )
+                    if not ok_pub:
+                        logger.info("[MORNING PRO PKG] GATE %s %s %s", code, pair_key, tier)
+                        continue
                     forex_posted += 1
                     posted = True
                     forex_tier_status[tier] = f"{pair_key} #{idea_id}"

@@ -34,6 +34,7 @@ from market_pulse.forex_trade_engine import generate_forex_trade_idea, get_forex
 from market_pulse.helpers import wat_now
 from market_pulse.price_fetchers import get_best_price
 from market_pulse.telegram_api import post_to_pro_channel
+from market_pulse.publication_gate import publish_canonical_trade
 from market_pulse.trade_engine_report import (
     finish_scan_run,
     record_candidate,
@@ -762,7 +763,36 @@ def run_trade_scanner():
             logger.debug("[SCANNER] final price check: %s", _fpc)
 
         try:
-            post_to_pro_channel(item["msg"])
+            tr = item.get("trade") or {}
+            ok_pub, pub_code = publish_canonical_trade(
+                msg=item["msg"],
+                idea_id=int(item.get("idea_id") or 0),
+                symbol=item.get("identifier") or "",
+                direction=item.get("direction") or tr.get("direction") or "",
+                timeframe=tr.get("timeframe") or item.get("timeframe") or "",
+                entry=tr.get("entry"),
+                stop=tr.get("stop"),
+                target1=tr.get("target1"),
+                market_type=item.get("asset_type") or "crypto",
+                tier=item.get("tier") or "",
+                source="scanner",
+            )
+            if not ok_pub:
+                record_candidate(
+                    scan_run_id,
+                    item["identifier"],
+                    item["tier"],
+                    "SUPPRESSED",
+                    rejection_reason=pub_code,
+                    direction=item.get("direction"),
+                    idea_id=item.get("idea_id"),
+                    score=score,
+                )
+                logger.info(
+                    "[SCANNER] GATE %s %s %s — %s",
+                    pub_code, item["identifier"], item["tier"], item.get("idea_id"),
+                )
+                continue
             used_groups.add(group)
             published += 1
             if (item.get("asset_type") or "") == "forex":
@@ -770,8 +800,6 @@ def run_trade_scanner():
             if is_overflow:
                 overflow_posts += 1
             _scanner_daily_count["count"] = already_today + published
-            pub_reason = "PRO_CHANNEL_OVERFLOW" if is_overflow else "PRO_CHANNEL"
-            mark_trade_publication(item.get("idea_id"), "PUBLISHED", pub_reason)
             record_candidate(
                 scan_run_id,
                 item["identifier"],
