@@ -46,7 +46,7 @@ from market_pulse.publication_gate import publish_canonical_trade
 
 # Best coins to feature in morning package (most liquid, best AI setups)
 MORNING_CRYPTO_COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "AVAX"]
-MORNING_FOREX_PAIRS  = ["USDT/NGN", "EUR/NGN", "GBP/NGN", "USD/NGN", "EUR/USD", "GBP/USD"]
+MORNING_FOREX_PAIRS  = ["EUR/USD", "GBP/USD"]  # tradeable FX only — NGN is P2P context, not trade pairs
 
 
 def build_morning_p2p_intelligence():
@@ -71,7 +71,7 @@ def run_morning_pro_package():
     2. Crypto Steady (best qualifying coin)
     3. Crypto Momentum (best qualifying coin)
     4. Crypto Edge (only if conditions strongly support it)
-    5. Forex Steady
+    5. Forex Steady (EUR/USD or GBP/USD)
     6. Forex Momentum
     7. Forex Edge (only if conditions strongly support it)
     8. P2P Intelligence
