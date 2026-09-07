@@ -775,6 +775,43 @@ class ProviderManager:
 
 _manager: "ProviderManager | None" = None
 
+# Recent liquidations for opportunity layer (in-memory ring; not a DB)
+from collections import deque
+import time as _time
+
+_recent_liquidations: deque = deque(maxlen=300)
+
+
+def _record_liquidation(liq: dict) -> None:
+    try:
+        if not isinstance(liq, dict):
+            return
+        row = dict(liq)
+        row["_ts"] = _time.time()
+        _recent_liquidations.append(row)
+    except Exception:
+        pass
+
+
+def get_recent_liquidations(coin: str | None = None, max_age_sec: float = 900.0, limit: int = 40) -> list:
+    """Recent liquidation events for opportunity scoring (last max_age_sec)."""
+    now = _time.time()
+    coin_u = (coin or "").upper().split("/")[0].strip()
+    out = []
+    for row in reversed(_recent_liquidations):
+        try:
+            if now - float(row.get("_ts") or 0) > max_age_sec:
+                continue
+            c = str(row.get("coin") or row.get("symbol") or "").upper().split("/")[0]
+            if coin_u and c and c != coin_u:
+                continue
+            out.append(row)
+            if len(out) >= limit:
+                break
+        except Exception:
+            continue
+    return out
+
 
 def start_derivatives_engine(admin_notify=None, on_liquidation=None):
     """
@@ -787,7 +824,16 @@ def start_derivatives_engine(admin_notify=None, on_liquidation=None):
     global _manager
     if _manager is not None:
         return
-    bybit = BybitLinearProvider(on_liquidation=on_liquidation)
+
+    def _liq_wrapper(liq):
+        _record_liquidation(liq)
+        if on_liquidation:
+            try:
+                on_liquidation(liq)
+            except Exception:
+                pass
+
+    bybit = BybitLinearProvider(on_liquidation=_liq_wrapper)
     okx = OKXProvider()
     _manager = ProviderManager(providers=[bybit, okx], admin_notify=admin_notify)
     _manager.start_all()
