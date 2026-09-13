@@ -1,2 +1,0 @@
-Evening deploy files uploading via Grok.
-Includes: NGN trade removal, crypto slot preference, publication integrity, macro shadow scanner.
