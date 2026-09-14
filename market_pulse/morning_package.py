@@ -32,6 +32,7 @@ from market_pulse.helpers import wat_now
 from market_pulse.p2p import get_p2p_rate, format_multi_p2p_intelligence, P2P_ASSETS
 from market_pulse.price_fetchers import get_best_price
 from market_pulse.telegram_api import post_to_pro_channel
+from market_pulse.publication_gate import publish_content
 from market_pulse.publication_gate import publish_canonical_trade
 
 
@@ -94,7 +95,15 @@ def run_morning_pro_package():
         f"Crypto setups · Forex setups · P2P read\n\n"
         f"<i>Only quality setups posted. Tiers skipped if conditions don\'t support them.</i>"
     )
-    post_to_pro_channel(header)
+    from market_pulse.helpers import wat_now as _wat_now
+    _d = _wat_now().strftime("%Y-%m-%d")
+    publish_content(
+        msg=header,
+        source="morning_package:header",
+        idempotency_key=f"morning_package:header:{_d}",
+        to_pro=True,
+        to_free=False,
+    )
     time.sleep(3)
 
     # ── Crypto Setups ─────────────────────────────────────────────────────
@@ -193,7 +202,13 @@ def run_morning_pro_package():
     try:
         p2p_msg = build_morning_p2p_intelligence()
         if p2p_msg:
-            post_to_pro_channel(p2p_msg)
+            publish_content(
+                msg=p2p_msg,
+                source="morning_package:p2p",
+                idempotency_key=f"morning_package:p2p:{_d}",
+                to_pro=True,
+                to_free=False,
+            )
             logger.info("[MORNING PRO PKG] P2P intelligence posted")
             time.sleep(2)
     except Exception as e:
@@ -228,7 +243,13 @@ def run_morning_pro_package():
         "⚡ Market Pulse Pro"
     )
     try:
-        post_to_pro_channel(summary)
+        publish_content(
+            msg=summary,
+            source="morning_package:summary",
+            idempotency_key=f"morning_package:summary:{_d}",
+            to_pro=True,
+            to_free=False,
+        )
     except Exception as e:
         logger.error(f"[MORNING PRO PKG] Summary post failed: {e}")
 

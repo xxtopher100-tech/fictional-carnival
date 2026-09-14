@@ -467,8 +467,9 @@ def check_channel_usdt_ngn_pulse():
             + f"{advice}\n\n"
             + f"<i>Source: {src or 'P2P'}  ·  Nigerian street rate  ·  NFA</i>"
         )
-        post_to_channel(free_msg)
-        post_to_pro_channel(pro_msg)
+        from market_pulse.publication_gate import publish_content
+        publish_content(msg=free_msg, source="p2p_pulse:free", idempotency_key=None, to_pro=False, to_free=True)
+        publish_content(msg=pro_msg, source="p2p_pulse:pro", idempotency_key=None, to_pro=True, to_free=False)
         now_s = now.strftime("%Y-%m-%d %H:%M:%S")
         c.execute(
             "INSERT INTO admin_settings (key, value, updated_at) VALUES (%s,%s,%s) "

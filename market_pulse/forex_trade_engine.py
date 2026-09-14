@@ -454,7 +454,6 @@ def build_forex_trade_message(pair_key, rate, tier, trade, idea_id=0, source_str
             lines.append(f"T1 Reward:    <b>+{t1_pct:.2f}%</b>")
         lines += [
             f"Confidence:   <b>{conf}</b>",
-            f"Max Size:     <b>{tier_cfg['max_size']}</b>",
             "",
         ]
 
@@ -578,7 +577,7 @@ def generate_forex_trade_idea(pair_key, tier="momentum"):
                     trade.get("confidence", "Moderate"),
                     f"1:{rr:.2f}",
                     str(round(float(trade["invalidation"]), 6)) if trade.get("invalidation") else None,
-                    TRADE_TIERS[tier]["max_size"],
+                    "",
                     (ai_raw or trade.get("rationale") or "")[:500],
                     now,
                 ),

@@ -70,6 +70,10 @@ ADMIN_CODE = os.environ.get("ADMIN_CODE", "")
 # Independent live shadow verifier (does not alter outcome_monitor)
 SHADOW_VERIFY_ENABLED = os.environ.get("SHADOW_VERIFY_ENABLED", "false").lower() in ("1", "true", "yes")
 SHADOW_VERIFY_PRIVATE_ONLY = os.environ.get("SHADOW_VERIFY_PRIVATE_ONLY", "true").lower() in ("1", "true", "yes")
+# Legacy dual closers OFF by default; single trade_lifecycle is primary
+LEGACY_OUTCOME = os.environ.get("LEGACY_OUTCOME", "false").lower() in ("1", "true", "yes")
+LEGACY_SHADOW = os.environ.get("LEGACY_SHADOW", "false").lower() in ("1", "true", "yes")
+TRADE_LIFECYCLE_ENABLED = os.environ.get("TRADE_LIFECYCLE_ENABLED", "true").lower() in ("1", "true", "yes")
 
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 PRO_CHANNEL_ID = os.environ.get("PRO_CHANNEL_ID", "")

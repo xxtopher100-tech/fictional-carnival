@@ -42,12 +42,12 @@ def swing_highs_lows(candles, left=3, right=3):
 # SUPPORT / RESISTANCE
 # ═══════════════════════════════════════════════════════════════════════════
 
-def support_resistance_levels(candles, left=3, right=3, cluster_pct=0.5, min_touches=2):
+def support_resistance_levels(candles, left=3, right=3, cluster_pct=1.0, min_touches=2):
     """
     Clusters swing highs/lows into support/resistance zones.
 
     cluster_pct: swing points within this % of each other are merged into
-    one zone (e.g. 0.5 = merge points within 0.5% of the zone's average price).
+    one zone (e.g. 1.0 = merge points within 1.0% of the zone's average price).
     min_touches: a zone must be touched by at least this many swing points
     to be reported (filters out noise).
 

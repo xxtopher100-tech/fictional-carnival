@@ -1507,10 +1507,17 @@ def check_key_market_alerts():
             if alert_id:
                 logger.info("[KEY ALERT] published id=#%s %s %s", alert_id, coin, event_label)
 
-            post_to_channel(build_free_key_alert(
-                coin, pub_price, ch, level, event_label=event_label, conf_tier="CONFIRMED",
-                alert_id=alert_id or None,
-            ))
+            from market_pulse.publication_gate import publish_content
+            publish_content(
+                msg=build_free_key_alert(
+                    coin, pub_price, ch, level, event_label=event_label, conf_tier="CONFIRMED",
+                    alert_id=alert_id or None,
+                ),
+                source="key_alert:free",
+                idempotency_key=None,
+                to_pro=False,
+                to_free=True,
+            )
 
                         # Pro channel — TESTING = watch only; confirmation may evaluate trade
             sd = get_secondary_coin(coin)
@@ -1581,19 +1588,26 @@ def check_key_market_alerts():
             else:
                 decision = ("EARLY: price is near the level only — no sustained hold/break proven yet. Wait for 15m tag + reaction or a confirmed close through the level." if conf_tier == "EARLY" else _testing_decision(status_label))
 
-            post_to_pro_channel(build_pro_key_alert(
-                coin, pub_price, ch, level,
-                entry=entry,
-                stop=stop,
-                target=target,
-                bias=bias,
-                confidence=confidence,
-                situation=situation,
-                context_line=context_line,
-                decision=decision,
-                conf_tier=conf_tier,
-                alert_id=alert_id or None,
-            ))
+            from market_pulse.publication_gate import publish_content
+            publish_content(
+                msg=build_pro_key_alert(
+                    coin, pub_price, ch, level,
+                    entry=entry,
+                    stop=stop,
+                    target=target,
+                    bias=bias,
+                    confidence=confidence,
+                    situation=situation,
+                    context_line=context_line,
+                    decision=decision,
+                    conf_tier=conf_tier,
+                    alert_id=alert_id or None,
+                ),
+                source="key_alert:pro",
+                idempotency_key=None,
+                to_pro=True,
+                to_free=False,
+            )
             sent += 1
             time.sleep(1)  # brief pause between alerts
 

@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-from market_pulse.config_runtime import ADMIN_IDS, logger
+from market_pulse.config_runtime import ADMIN_IDS, logger, LEGACY_OUTCOME
 from market_pulse.db import get_db
 from market_pulse.helpers import format_price, wat_now
 from market_pulse.price_fetchers import get_best_price
@@ -191,6 +191,9 @@ def _fmt_px(v) -> str:
 
 def monitor_open_trades(limit: int = 40) -> list:
     """Evaluate open trades; notify admin once per state transition."""
+    if not LEGACY_OUTCOME:
+        logger.debug("[OUTCOME] LEGACY_OUTCOME off — monitor_open_trades skipped")
+        return []
     _ensure_schema()
     if not ADMIN_IDS:
         logger.warning(
@@ -448,19 +451,47 @@ def _process_one_trade(
     try:
         from market_pulse.candle_engine import get_candles
         candles = get_candles(coin) or []
+        # If 1H store is thin, try explicit interval helpers when available
+        if len(candles or []) < 3:
+            for _iv in ("1h", "15m", "5m"):
+                try:
+                    extra = get_candles(coin, interval=_iv)  # type: ignore[call-arg]
+                    if extra and len(extra) > len(candles or []):
+                        candles = extra
+                        break
+                except TypeError:
+                    break
+                except Exception:
+                    continue
     except Exception:
         candles = []
 
     after = _candles_after_timestamp(candles, created_at or "")
     if not after:
         logger.debug(
-            "[OUTCOME] #%s %s no post-signal 1H candles (n=%s) — live price fallback",
+            "[OUTCOME] #%s %s no post-signal candles (n=%s) — live/extreme fallback",
             idea_id, coin, len(candles or []),
         )
     targets = [t for t in (t1, t2) if t]
     path = evaluate_path(
         direction, float(entry), float(stop), targets, after, be_trigger_r=1.0,
     ) or {}
+
+    # Load durable extremes from prior polls (survives pullbacks between cycles)
+    prev_hi = prev_lo = None
+    try:
+        c.execute("SELECT outcome_detail FROM trade_ideas WHERE id=%s", (idea_id,))
+        _od_row = c.fetchone()
+        _od_raw = (_od_row[0] if _od_row else None) or ""
+        if _od_raw:
+            _od = json.loads(_od_raw) if isinstance(_od_raw, str) else (_od_raw or {})
+            if isinstance(_od, dict):
+                if _od.get("peak_high") is not None:
+                    prev_hi = float(_od["peak_high"])
+                if _od.get("trough_low") is not None:
+                    prev_lo = float(_od["trough_low"])
+    except Exception:
+        prev_hi = prev_lo = None
 
     # No post-signal candles and no terminal from path: do not invent a win/loss
     # (live tick may still resolve later; expiry still handled below)
@@ -493,11 +524,14 @@ def _process_one_trade(
     else:
         new_state = outcome or "ACTIVE"
 
-    # Live / range assist — when path is still open, resolve from evidence.
-    # Bug fix (trade #70 style): spot-only live price missed a stop wick if the
-    # next poll was after a pullback. Use post-signal candle HIGH/LOW range as
-    # well as current tick so a stop/TP that already traded through is closed.
-    if new_state in ("ACTIVE", "STILL_OPEN", "ENTRY_NOT_REACHED", "", "None"):
+    # Live / range assist + durable extremes (final mismatch hardening).
+    # Problem: poll ~5m can miss a wick if next poll is after pullback; thin 1H
+    # candles make evaluate_path stay ACTIVE while shadow already saw the print.
+    # Fix: merge candle extremes + live tick + peak/trough stored from prior polls.
+    _assist_states = (
+        "ACTIVE", "STILL_OPEN", "ENTRY_NOT_REACHED", "", "None", "TP1_HIT",
+    )
+    if new_state in _assist_states or (last_notified or "") == "TP1_HIT":
         d = (direction or "long").lower()
         is_long = d.startswith("long") or d in ("buy", "l")
         try:
@@ -509,7 +543,6 @@ def _process_one_trade(
         except Exception:
             px = en = st = tp1 = tp2 = None
 
-        # Extremes since signal from completed path candles (1H OHLC).
         hi = lo = None
         if after:
             try:
@@ -521,13 +554,31 @@ def _process_one_trade(
                     lo = min(lows)
             except Exception:
                 hi = lo = None
-        # Fold current tick into extremes when present
-        if px:
+        if px is not None:
             hi = max(hi, px) if hi is not None else px
             lo = min(lo, px) if lo is not None else px
+        # Durable extremes from previous outcome cycles
+        if prev_hi is not None:
+            hi = max(hi, prev_hi) if hi is not None else prev_hi
+        if prev_lo is not None:
+            lo = min(lo, prev_lo) if lo is not None else prev_lo
+
+        # Persist running extremes for next cycle (even if still open)
+        try:
+            detail = {
+                "peak_high": hi,
+                "trough_low": lo,
+                "updated_at": now_s,
+                "source": "monitor_extremes_v2",
+            }
+            c.execute(
+                "UPDATE trade_ideas SET outcome_detail=%s WHERE id=%s",
+                (json.dumps(detail), idea_id),
+            )
+        except Exception:
+            pass
 
         if en is not None and (hi is not None or lo is not None or px is not None):
-            # Entry reachable in the post-signal range?
             entry_seen = False
             if is_long:
                 if lo is not None and lo <= en:
@@ -536,6 +587,9 @@ def _process_one_trade(
                     entry_seen = True
                 if hi is not None and lo is not None and lo <= en <= hi:
                     entry_seen = True
+                # Already activated earlier this trade
+                if (last_notified or "") in ("ACTIVE", "TP1_HIT", "TP2_HIT"):
+                    entry_seen = True
             else:
                 if hi is not None and hi >= en:
                     entry_seen = True
@@ -543,10 +597,10 @@ def _process_one_trade(
                     entry_seen = True
                 if hi is not None and lo is not None and lo <= en <= hi:
                     entry_seen = True
+                if (last_notified or "") in ("ACTIVE", "TP1_HIT", "TP2_HIT"):
+                    entry_seen = True
 
             if is_long:
-                # Prefer stop/TP only if entry was seen OR current/extreme already
-                # through entry (conservative: allow adverse beyond stop only with entry).
                 if entry_seen or (px is not None and px >= en) or (lo is not None and lo <= en):
                     if st is not None and lo is not None and lo <= st:
                         new_state = "STOP_HIT"
@@ -557,9 +611,11 @@ def _process_one_trade(
                     elif tp2 is not None and px is not None and px >= tp2:
                         new_state = "TP2_HIT"
                     elif tp1 is not None and hi is not None and hi >= tp1:
-                        new_state = "TP1_HIT"
+                        if new_state not in ("TP2_HIT", "STOP_HIT"):
+                            new_state = "TP1_HIT"
                     elif tp1 is not None and px is not None and px >= tp1:
-                        new_state = "TP1_HIT"
+                        if new_state not in ("TP2_HIT", "STOP_HIT"):
+                            new_state = "TP1_HIT"
                     elif new_state == "ENTRY_NOT_REACHED" and entry_seen:
                         new_state = "ACTIVE"
             else:
@@ -573,9 +629,11 @@ def _process_one_trade(
                     elif tp2 is not None and px is not None and px <= tp2:
                         new_state = "TP2_HIT"
                     elif tp1 is not None and lo is not None and lo <= tp1:
-                        new_state = "TP1_HIT"
+                        if new_state not in ("TP2_HIT", "STOP_HIT"):
+                            new_state = "TP1_HIT"
                     elif tp1 is not None and px is not None and px <= tp1:
-                        new_state = "TP1_HIT"
+                        if new_state not in ("TP2_HIT", "STOP_HIT"):
+                            new_state = "TP1_HIT"
                     elif new_state == "ENTRY_NOT_REACHED" and entry_seen:
                         new_state = "ACTIVE"
 
@@ -694,10 +752,17 @@ def _process_one_trade(
                     _notify_admins(msg)
                     if new_state in ("TP1_HIT", "TP2_HIT", "STOP_HIT", "EXPIRED"):
                         try:
-                            post_to_pro_channel(
-                                f"📋 <b>Trade #{idea_id} — {new_state.replace('_', ' ')}</b>\n"
-                                f"{coin} · {(direction or '').upper()}\n"
-                                f"<i>Live outcome · detail sent to admin</i>"
+                            from market_pulse.publication_gate import publish_content
+                            publish_content(
+                                msg=(
+                                    f"📋 <b>Trade #{idea_id} — {new_state.replace('_', ' ')}</b>\n"
+                                    f"{coin} · {(direction or '').upper()}\n"
+                                    f"<i>Live outcome · detail sent to admin</i>"
+                                ),
+                                source="outcome_line",
+                                idempotency_key=f"outcome:{idea_id}:{new_state}",
+                                to_pro=True,
+                                to_free=False,
                             )
                         except Exception:
                             pass
@@ -1527,6 +1592,9 @@ def diagnose_open_trades(limit: int = 25) -> str:
 
 def run_outcome_cycle():
     """Single safe cycle: trades + key levels. Never raises to caller."""
+    if not LEGACY_OUTCOME:
+        logger.debug("[OUTCOME] LEGACY_OUTCOME off — run_outcome_cycle skipped")
+        return
     try:
         monitor_open_trades()
     except Exception as e:

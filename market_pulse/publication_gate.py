@@ -769,3 +769,67 @@ def ensure_confidence(text: str, confidence: str = "Moderate") -> str:
         text,
     )
     return out
+
+
+def publish_content(
+    *,
+    msg: str,
+    source: str,
+    idempotency_key: str | None = None,
+    to_pro: bool = True,
+    to_free: bool = False,
+) -> tuple[bool, str]:
+    """Publish a non-trade content post (brief, alert, summary).
+
+    Skips trade-level dedupe/fingerprinting. Respects an optional
+    idempotency key so scheduler retries don't double-post.
+    """
+    if not msg:
+        return False, "MISSING_MSG"
+    if idempotency_key:
+        db = None
+        try:
+            if get_db is None:
+                raise RuntimeError("get_db unavailable")
+            db = get_db()
+            c = db.cursor()
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS content_publish_log "
+                "(idempotency_key TEXT PRIMARY KEY, source TEXT, published_at TEXT NOT NULL)"
+            )
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            c.execute(
+                "INSERT INTO content_publish_log (idempotency_key, source, published_at) "
+                "VALUES (%s,%s,%s) ON CONFLICT (idempotency_key) DO NOTHING RETURNING idempotency_key",
+                (idempotency_key, source, now),
+            )
+            claimed = c.fetchone() is not None
+            db.commit()
+            if not claimed:
+                return False, "IDEMPOTENT_SKIP"
+        except Exception as e:
+            logger.warning("[PUB GATE] content idempotency: %s", e)
+            if db:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        finally:
+            if db:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    try:
+        from market_pulse.telegram_api import post_to_pro_channel, post_to_channel
+        if to_pro:
+            post_to_pro_channel(msg)
+        if to_free:
+            post_to_channel(msg)
+        logger.info("[PUB GATE] content published source=%s key=%s pro=%s free=%s",
+                    source, idempotency_key, to_pro, to_free)
+        return True, "PUBLISHED"
+    except Exception as e:
+        logger.error("[PUB GATE] content publish failed source=%s: %s", source, e)
+        return False, "TELEGRAM_ERROR"

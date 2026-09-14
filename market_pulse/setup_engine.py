@@ -80,60 +80,92 @@ def _last_atr(candles, period=14):
     return None
 
 
-# Tier parameters for programmatic setups (ATR + structure)
-_TIER_SPEC = {
-    # steady = SAFE — tight risk, must have structure + trend alignment
+def classify_regime(candles, atr_series, adx_series) -> str:
+    """Return 'trend' | 'chop' | 'quiet' | 'volatile'."""
+    try:
+        if not adx_series or adx_series[-1] is None:
+            return "quiet"
+        adx_last = float(adx_series[-1])
+        atr_vals = [v for v in (atr_series or []) if v is not None and v > 0]
+        if len(atr_vals) < 50:
+            return "trend" if adx_last >= 22 else "chop"
+        recent = atr_vals[-1]
+        prior = sorted(atr_vals[-100:-1]) if len(atr_vals) >= 100 else sorted(atr_vals[:-1])
+        if not prior:
+            return "trend" if adx_last >= 22 else "chop"
+        median = prior[len(prior) // 2]
+        if median <= 0:
+            return "trend" if adx_last >= 22 else "chop"
+        ratio = recent / median
+        if ratio >= 2.0:
+            return "volatile"
+        if adx_last < 18:
+            return "quiet"
+        if adx_last >= 22:
+            return "trend"
+        return "chop"
+    except Exception:
+        return "chop"
+
+
+# Unified tier definitions (setup_engine + edge_trade_engine).
+# Tier branch behavior stays in build_programmatic_setup — do not add unread flags.
+# max_stop_pct is a FRACTION (0.05 = 5%) for setup math; edge_trade_engine
+# converts to percentage points for prompts/validation display.
+TIER_DEFINITIONS = {
     "steady": {
+        "label": "SAFE TRADE",
+        "emoji": "🟢",
+        "risk_desc": "Highest confirmation — capital preservation",
         "max_stop_pct": 0.05,
+        "min_target_pct": 8.0,
+        "min_rr": 1.5,
+        "min_rr_t1": 1.5,
         "stop_atr": 0.9,
         "t1_r": 1.8,
         "t2_r": 2.8,
-        "min_rr_t1": 1.5,
-        "need_structure": True,
-        "require_trend": True,
-        "require_level": True,
-        "allow_counter_level": False,  # no LONG into resistance without breakout
         "extension_min": 0.0,
-        "extension_max": 1.2,  # not chasing stretched moves
-        "trail_pct": 0.004,
+        "extension_max": 1.2,
+        "trail_pct": 0.010,
         "be_trigger_r": 1.0,
         "display": "SAFE",
     },
-    # momentum = NORMAL — trend continuation, structure preferred not mandatory
     "momentum": {
+        "label": "NORMAL TRADE",
+        "emoji": "🟡",
+        "risk_desc": "Balanced setup — default trading tier",
         "max_stop_pct": 0.08,
+        "min_target_pct": 12.0,
+        "min_rr": 1.5,
+        "min_rr_t1": 1.4,
         "stop_atr": 1.2,
         "t1_r": 1.6,
         "t2_r": 2.6,
-        "min_rr_t1": 1.4,
-        "need_structure": False,
-        "require_trend": True,
-        "require_level": False,
-        "allow_counter_level": False,
         "extension_min": 0.0,
         "extension_max": 2.0,
-        "trail_pct": 0.005,
+        "trail_pct": 0.012,
         "be_trigger_r": 1.0,
         "display": "NORMAL",
     },
-    # edge = AGGRESSIVE — earlier, needs catalyst, still capped risk
     "edge": {
+        "label": "AGGRESSIVE TRADE",
+        "emoji": "🔴",
+        "risk_desc": "HIGHER SETUP RISK — calculated early opportunity (not larger size)",
         "max_stop_pct": 0.12,
+        "min_target_pct": 20.0,
+        "min_rr": 1.8,
+        "min_rr_t1": 1.6,
         "stop_atr": 1.4,
         "t1_r": 2.0,
         "t2_r": 3.2,
-        "min_rr_t1": 1.6,
-        "need_structure": False,
-        "require_trend": False,  # can anticipate if catalyst + invalidation exist
-        "require_level": False,
-        "allow_counter_level": True,  # breakout/rejection style allowed with thesis
         "extension_min": 0.8,
         "extension_max": 3.5,
-        "trail_pct": 0.006,
+        "trail_pct": 0.015,
         "be_trigger_r": 1.0,
         "display": "AGGRESSIVE",
     },
 }
+_TIER_SPEC = TIER_DEFINITIONS
 
 
 def _fmt_px(v: float) -> str:
@@ -297,6 +329,17 @@ def build_programmatic_setup(coin: str, price: float, tier: str = "steady") -> d
     if not atr_val or atr_val <= 0:
         return None
 
+    from market_pulse.indicators_ext import adx as _adx
+    adx_series = _adx(candles, period=14)
+    regime = classify_regime(candles, atr(candles, 14), adx_series)
+
+    if tier in ("steady", "momentum") and regime == "chop":
+        logger.info(f"[SETUP ENGINE] {coin} {tier} blocked — regime=chop")
+        return None
+    if regime == "quiet" and tier == "edge":
+        logger.info(f"[SETUP ENGINE] {coin} {tier} blocked — regime=quiet (no catalyst)")
+        return None
+
     ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
     if not ema20 or not ema50 or ema20[-1] is None or ema50[-1] is None:
@@ -394,14 +437,13 @@ def build_programmatic_setup(coin: str, price: float, tier: str = "steady") -> d
 
     entry = float(price)
     if direction == "long":
-        struct_stop = (support - 0.35 * atr_val) if support else (entry - spec["stop_atr"] * atr_val)
-        atr_stop = entry - spec["stop_atr"] * atr_val
-        stop = min(struct_stop, atr_stop)
+        if support is not None and support < entry:
+            stop = support - 0.35 * atr_val
+        else:
+            stop = entry - spec["stop_atr"] * atr_val
         risk = entry - stop
         if risk <= 0 or risk / entry > spec["max_stop_pct"]:
-            stop = entry - min(spec["stop_atr"] * atr_val, entry * spec["max_stop_pct"] * 0.9)
-            risk = entry - stop
-        if risk <= 0 or risk / entry > spec["max_stop_pct"]:
+            logger.info(f"[SETUP ENGINE] {coin} {tier} — structural stop {risk/entry:.2%} exceeds max_stop_pct, reject")
             return None
         t1, t1_src = _structural_target("long", entry, risk, atr_val, support, resistance, candles, spec["t1_r"])
         t2, t2_src = _structural_target("long", entry, risk, atr_val, support, resistance, candles, spec["t2_r"])
@@ -409,14 +451,13 @@ def build_programmatic_setup(coin: str, price: float, tier: str = "steady") -> d
             t2 = entry + risk * spec["t2_r"]
             t2_src = "r_multiple"
     else:
-        struct_stop = (resistance + 0.35 * atr_val) if resistance else (entry + spec["stop_atr"] * atr_val)
-        atr_stop = entry + spec["stop_atr"] * atr_val
-        stop = max(struct_stop, atr_stop)
+        if resistance is not None and resistance > entry:
+            stop = resistance + 0.35 * atr_val
+        else:
+            stop = entry + spec["stop_atr"] * atr_val
         risk = stop - entry
         if risk <= 0 or risk / entry > spec["max_stop_pct"]:
-            stop = entry + min(spec["stop_atr"] * atr_val, entry * spec["max_stop_pct"] * 0.9)
-            risk = stop - entry
-        if risk <= 0 or risk / entry > spec["max_stop_pct"]:
+            logger.info(f"[SETUP ENGINE] {coin} {tier} — structural stop {risk/entry:.2%} exceeds max_stop_pct, reject")
             return None
         t1, t1_src = _structural_target("short", entry, risk, atr_val, support, resistance, candles, spec["t1_r"])
         t2, t2_src = _structural_target("short", entry, risk, atr_val, support, resistance, candles, spec["t2_r"])
@@ -425,7 +466,7 @@ def build_programmatic_setup(coin: str, price: float, tier: str = "steady") -> d
             t2_src = "r_multiple"
 
     rr1 = abs(t1 - entry) / risk
-    if rr1 < spec["min_rr_t1"] * 0.85:  # slight tolerance after structure snap
+    if rr1 < spec["min_rr_t1"]:
         logger.info(f"[SETUP ENGINE] {coin} {tier} — T1 R:R {rr1:.2f} too low")
         return None
 
@@ -470,6 +511,7 @@ def build_programmatic_setup(coin: str, price: float, tier: str = "steady") -> d
         "display_tier": _TIER_SPEC.get(tier, {}).get("display", tier.upper()),
         "reasons": reasons,
         "news_flag": news["flag"],
+        "regime": regime,
         "entry_raw": entry,
         "stop_raw": stop,
         "target1_raw": t1,

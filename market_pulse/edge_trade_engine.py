@@ -33,7 +33,10 @@ from market_pulse.fear_greed import get_fear_greed
 from market_pulse.helpers import format_price, wat_now
 from market_pulse.p2p import get_p2p_rate
 from market_pulse.price_fetchers import get_best_price, get_secondary_coin
-from market_pulse.setup_engine import build_programmatic_setup, news_market_flag, resolve_horizon, compute_valid_until
+from market_pulse.setup_engine import (
+    build_programmatic_setup, news_market_flag, resolve_horizon, compute_valid_until,
+    TIER_DEFINITIONS,
+)
 from market_pulse.telegram_api import send
 
 
@@ -41,31 +44,15 @@ from market_pulse.telegram_api import send
 # ⚡ EDGE TRADE ENGINE — THREE-TIER TRADE SYSTEM
 # ═══════════════════════════════════════════════════════════════════════════
 
-TRADE_TIERS = {
-    # Keys kept as steady/momentum/edge for DB + callers. Display = SAFE/NORMAL/AGGRESSIVE.
-    "steady": {
-        "label": "SAFE TRADE", "emoji": "🟢",
-        "risk_desc": "Highest confirmation — capital preservation",
-        "max_stop_pct": 5.0, "min_target_pct": 8.0, "min_rr": 1.5,
-        "max_size": "2-4% of portfolio",
-        "display_tier": "SAFE",
-    },
-    "momentum": {
-        "label": "NORMAL TRADE", "emoji": "🟡",
-        "risk_desc": "Balanced setup — default trading tier",
-        "max_stop_pct": 8.0, "min_target_pct": 12.0, "min_rr": 1.5,
-        "max_size": "2-3% of portfolio",
-        "display_tier": "NORMAL",
-    },
-    "edge": {
-        "label": "AGGRESSIVE TRADE", "emoji": "🔴",
-        "risk_desc": "HIGHER SETUP RISK — calculated early opportunity (not larger size)",
-        "max_stop_pct": 12.0, "min_target_pct": 20.0, "min_rr": 1.8,
-        "max_size": "1-2% of portfolio MAX",
-        "display_tier": "AGGRESSIVE",
-    },
-}
-# Aliases so callers can use safe/normal/aggressive
+# Derived from setup_engine.TIER_DEFINITIONS (single source of truth).
+# max_stop_pct stored as fraction there; convert to percentage points for prompts.
+TRADE_TIERS = {}
+for _k, _v in TIER_DEFINITIONS.items():
+    _cfg = dict(_v)
+    _msp = float(_cfg.get("max_stop_pct") or 0)
+    if _msp <= 1.0:
+        _cfg["max_stop_pct"] = _msp * 100.0
+    TRADE_TIERS[_k] = _cfg
 TRADE_TIERS["safe"] = TRADE_TIERS["steady"]
 TRADE_TIERS["normal"] = TRADE_TIERS["momentum"]
 TRADE_TIERS["aggressive"] = TRADE_TIERS["edge"]
@@ -507,7 +494,7 @@ def save_trade_idea(coin, tier, trade, ai_raw=""):
                 (coin, tier_key, direction, tf,
                  trade.get("entry"), trade.get("stop"), trade.get("target1"), trade.get("target2"),
                  trade.get("bias","Neutral"), trade.get("confidence","Moderate"), rr_str,
-                 trade.get("invalidation"), TRADE_TIERS[tier_key]["max_size"],
+                 trade.get("invalidation"), "",
                  ai_raw[:500] if ai_raw else "", now,
                  valid_until, expected_horizon, trade.get("lifecycle_status") or "ENTRY_NOT_REACHED",
                  "PENDING", None)
@@ -522,7 +509,7 @@ def save_trade_idea(coin, tier, trade, ai_raw=""):
                 (coin, tier_key, direction, tf,
                  trade.get("entry"), trade.get("stop"), trade.get("target1"), trade.get("target2"),
                  trade.get("bias","Neutral"), trade.get("confidence","Moderate"), rr_str,
-                 trade.get("invalidation"), TRADE_TIERS[tier_key]["max_size"],
+                 trade.get("invalidation"), "",
                  ai_raw[:500] if ai_raw else "", now)
             )
         idea_id = c.fetchone()[0]
@@ -543,14 +530,14 @@ def save_trade_idea(coin, tier, trade, ai_raw=""):
 
 
 def mark_trade_publication(idea_id, status: str, reason: str | None = None) -> bool:
-    """Set publication_status: PUBLISHED | SUPPRESSED | PUBLISH_FAILED | PENDING.
+    """Set publication_status: PUBLISHED | SUPPRESSED | PUBLISH_FAILED | PENDING | TEMPORARILY_QUEUED.
 
     Official performance uses only PUBLISHED.
     """
     if not idea_id:
         return False
     status = (status or "").upper().strip()
-    if status not in ("PUBLISHED", "SUPPRESSED", "PUBLISH_FAILED", "PENDING"):
+    if status not in ("PUBLISHED", "SUPPRESSED", "PUBLISH_FAILED", "PENDING", "TEMPORARILY_QUEUED"):
         logger.warning("[TRADE IDEAS] invalid publication_status %s", status)
         return False
     db = None
@@ -677,7 +664,6 @@ def build_trade_idea_message(coin, price, tier, trade, idea_id=0):
             f"Stop Risk:    <b>-{metrics['risk_pct']:.1f}%</b>  (${metrics['pot_loss']:,.0f} per $1,000)",
             f"T1 Reward:    <b>+{metrics['reward_pct']:.1f}%</b>  (${metrics['pot_profit']:,.0f} per $1,000)",
             f"Confidence:   <b>{conf}</b>",
-            f"Max Size:     <b>{tier_cfg['max_size']}</b>",
             "",
         ]
     if trade.get("management"):

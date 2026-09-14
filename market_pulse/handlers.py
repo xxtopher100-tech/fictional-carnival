@@ -22,6 +22,8 @@ from logging.handlers import RotatingFileHandler
 
 from market_pulse.ai_engine import ask_ai
 from market_pulse.alerts import KEY_ALERT_COINS, check_key_market_alerts, daily_digest
+from market_pulse.key_alerts_engine import run_key_alerts_cycle
+from market_pulse.trade_lifecycle import run_lifecycle_cycle
 from market_pulse.arbitrage import scan_arbitrage
 from market_pulse.candle_engine import candle_engine_status, start_candle_engine
 from market_pulse.channel_lock import is_user_in_channel
@@ -30,6 +32,7 @@ from market_pulse.config_runtime import (
     ADMIN_IDS, BOT_TOKEN, COINS, LOG_FILE, P2P_FIATS, SCHEDULE, load_admin_config, logger, save_admin_config,
     get_channel_enabled, set_channel_enabled, get_pro_channel_id, set_pro_channel_id, get_mirror_mode, set_mirror_mode,
     validate_critical_config, config_status_summary,
+    LEGACY_OUTCOME, LEGACY_SHADOW, TRADE_LIFECYCLE_ENABLED,
 )
 from market_pulse.content_engine import build_admin_dashboard, build_weekly_educational_content, format_content_package_for_admin, generate_and_deliver_content_package, get_content_package_by_id, get_pending_content_packages, mark_package_status
 from market_pulse.db import get_db, init_db
@@ -61,7 +64,7 @@ from market_pulse.screens import handle_position_calc, show_help, show_main_menu
 from market_pulse.telegram_api import answer_cb, edit, post_to_channel, post_to_pro_channel, send
 from market_pulse.trade_journal import close_trade
 from market_pulse.trade_scanner import run_trade_scanner, get_trade_scan_interval_sec, get_trade_scan_interval_sec
-from market_pulse.publication_gate import process_publication_queue
+from market_pulse.publication_gate import process_publication_queue, publish_content
 from market_pulse.setup_engine import score_open_trade_ideas, outcome_summary
 from market_pulse.outcome_monitor import run_outcome_cycle, send_weekly_report_private
 from market_pulse.trade_engine_report import send_daily_engine_report
@@ -244,14 +247,17 @@ def run():
                     logger.error("[PRICE ALERTS] %s" % e)
                 last_watchlist_check = now
 
-            # ── KEY MARKET LEVEL ALERTS ───────────────────────────────────────
-            # Poll every 10 minutes for level events — posting is gated inside check_key_market_alerts
-            # (proximity, cooldowns, global gap). Not a "post every 10/30 min" schedule.
+            # ── KEY ALERTS V2 (levels + major-move developing) ────────────────
+            # Poll every 10 minutes — posting gated inside engines.
             if now - last_key_alert_check >= 600:
                 try:
-                    check_key_market_alerts()
+                    run_key_alerts_cycle(include_legacy_levels=True)
                 except Exception as e:
-                    logger.error("[KEY ALERT] %s" % e)
+                    logger.error("[KEY ALERTS V2] %s" % e)
+                    try:
+                        check_key_market_alerts()
+                    except Exception as e2:
+                        logger.error("[KEY ALERT] %s" % e2)
                 last_key_alert_check = now
 
             # ── WHALE / BREAKOUT DETECTION ────────────────────────────────────
@@ -283,16 +289,36 @@ def run():
                     logger.error("[PUB QUEUE] %s" % e)
                 last_pub_queue = now
 
-            # Real-time follow-up (private admin notifications on TP/SL/expiry)
+            # Single trade lifecycle (clean closer) — primary outcome path
             if now - last_outcome_score >= 300:
-                try:
-                    threading.Thread(
-                        target=run_outcome_cycle,
-                        name="OutcomeMonitor",
-                        daemon=True,
-                    ).start()
-                except Exception as e:
-                    logger.error("[OUTCOME MONITOR] %s" % e)
+                if TRADE_LIFECYCLE_ENABLED:
+                    try:
+                        threading.Thread(
+                            target=run_lifecycle_cycle,
+                            name="TradeLifecycle",
+                            daemon=True,
+                        ).start()
+                    except Exception as e:
+                        logger.error("[LIFECYCLE] %s" % e)
+                # Legacy outcome/shadow OFF unless LEGACY_* env explicitly true
+                if LEGACY_OUTCOME:
+                    try:
+                        threading.Thread(
+                            target=run_outcome_cycle,
+                            name="OutcomeMonitor",
+                            daemon=True,
+                        ).start()
+                    except Exception as e:
+                        logger.error("[OUTCOME MONITOR] %s" % e)
+                if LEGACY_SHADOW:
+                    try:
+                        threading.Thread(
+                            target=run_shadow_cycle,
+                            name="ShadowVerifier",
+                            daemon=True,
+                        ).start()
+                    except Exception as e:
+                        logger.error("[SHADOW] %s" % e)
                 try:
                     threading.Thread(
                         target=score_open_trade_ideas,
@@ -301,14 +327,6 @@ def run():
                     ).start()
                 except Exception as e:
                     logger.error("[OUTCOME SCORE] %s" % e)
-                try:
-                    threading.Thread(
-                        target=run_shadow_cycle,
-                        name="ShadowVerifier",
-                        daemon=True,
-                    ).start()
-                except Exception as e:
-                    logger.error("[SHADOW] %s" % e)
                 last_outcome_score = now
 
             # ── P2P RATE MONITORING ───────────────────────────────────────────
@@ -366,11 +384,21 @@ def run():
                             _morning_btc_snapshot["day"] = str(wat_day)
                         else:
                             logger.warning("[CHANNEL] Morning BTC snapshot skipped — price unavailable")
-                        if get_bot_mode() == "everyone":
-                            post_to_channel(pro_content)
-                        else:
-                            post_to_channel(build_morning_briefing())
-                        post_to_pro_channel(pro_content)
+                        free_msg = pro_content if get_bot_mode() == "everyone" else build_morning_briefing()
+                        publish_content(
+                            msg=free_msg,
+                            source="scheduled_brief:morning_free",
+                            idempotency_key=f"brief:morning_free:{wat_day}",
+                            to_pro=False,
+                            to_free=True,
+                        )
+                        publish_content(
+                            msg=pro_content,
+                            source="scheduled_brief:morning",
+                            idempotency_key=f"brief:morning:{wat_day}",
+                            to_pro=True,
+                            to_free=False,
+                        )
                     except Exception as _me:
                         # Release durable lock so a later process/admin can retry.
                         # Keep morning_posted=True this process to avoid a tight retry loop
@@ -432,11 +460,21 @@ def run():
                       if significant_move:
                         logger.info("[CHANNEL] Midday snapshot — significant market move detected")
                         pro_content = build_midday_snapshot_pro()
-                        if get_bot_mode() == "everyone":
-                            post_to_channel(pro_content)
-                        else:
-                            post_to_channel(build_midday_snapshot())
-                        post_to_pro_channel(pro_content)
+                        free_msg = pro_content if get_bot_mode() == "everyone" else build_midday_snapshot()
+                        publish_content(
+                            msg=free_msg,
+                            source="scheduled_brief:midday_free",
+                            idempotency_key=f"brief:midday_free:{wat_day}",
+                            to_pro=False,
+                            to_free=True,
+                        )
+                        publish_content(
+                            msg=pro_content,
+                            source="scheduled_brief:midday",
+                            idempotency_key=f"brief:midday:{wat_day}",
+                            to_pro=True,
+                            to_free=False,
+                        )
                         try:
                             btc_p, btc_c = get_best_price("BTC")
                             fg_d = get_fear_greed()
@@ -464,15 +502,31 @@ def run():
                     else:
                       logger.info("[CHANNEL] Evening recap")
                       pro_content = build_evening_recap_pro()
-                      if get_bot_mode() == "everyone":
-                          post_to_channel(pro_content)
-                      else:
-                          post_to_channel(build_evening_recap())
-                      post_to_pro_channel(pro_content)
+                      free_msg = pro_content if get_bot_mode() == "everyone" else build_evening_recap()
+                      publish_content(
+                          msg=free_msg,
+                          source="scheduled_brief:evening_free",
+                          idempotency_key=f"brief:evening_free:{wat_day}",
+                          to_pro=False,
+                          to_free=True,
+                      )
+                      publish_content(
+                          msg=pro_content,
+                          source="scheduled_brief:evening",
+                          idempotency_key=f"brief:evening:{wat_day}",
+                          to_pro=True,
+                          to_free=False,
+                      )
                       try:
-                          post_to_pro_channel(format_multi_p2p_intelligence(
-                              title="P2P INTELLIGENCE — EVENING READ"
-                          ))
+                          publish_content(
+                              msg=format_multi_p2p_intelligence(
+                                  title="P2P INTELLIGENCE — EVENING READ"
+                              ),
+                              source="scheduled_brief:evening_p2p",
+                              idempotency_key=f"brief:evening_p2p:{wat_day}",
+                              to_pro=True,
+                              to_free=False,
+                          )
                       except Exception as e:
                           logger.error("[EVENING P2P] %s" % e)
                       try:
@@ -507,11 +561,21 @@ def run():
                     else:
                       logger.info("[CHANNEL] Weekly Edge")
                       pro_content = build_weekly_edge_pro()
-                      if get_bot_mode() == "everyone":
-                          post_to_channel(pro_content)
-                      else:
-                          post_to_channel(build_weekly_edge())
-                      post_to_pro_channel(pro_content)
+                      free_msg = pro_content if get_bot_mode() == "everyone" else build_weekly_edge()
+                      publish_content(
+                          msg=free_msg,
+                          source="scheduled_brief:weekly_free",
+                          idempotency_key=f"brief:weekly_free:{wat_day}",
+                          to_pro=False,
+                          to_free=True,
+                      )
+                      publish_content(
+                          msg=pro_content,
+                          source="scheduled_brief:weekly",
+                          idempotency_key=f"brief:weekly:{wat_day}",
+                          to_pro=True,
+                          to_free=False,
+                      )
                       try:
                           btc_p, btc_c = get_best_price("BTC")
                           fg_d = get_fear_greed()
@@ -1222,11 +1286,28 @@ def run():
                             try:
                                 msg, trade, idea_id = generate_forex_trade_idea(pair_arg, tier_arg)
                                 if msg and idea_id:
-                                    post_to_pro_channel(msg)
-                                    send(chat_id,
-                                        f"✅ <b>Forex Idea #{idea_id}</b> posted to Pro channel.\n"
-                                        f"Pair: {pair_arg} | Tier: {tier_arg.upper()}\n"
-                                        f"Use /closetrade {idea_id} [result] when it closes.")
+                                    from market_pulse.publication_gate import publish_canonical_trade
+                                    ok, reason = publish_canonical_trade(
+                                        msg=msg,
+                                        idea_id=idea_id,
+                                        symbol=pair_arg,
+                                        direction=(trade or {}).get("direction") or "long",
+                                        timeframe=(trade or {}).get("timeframe") or "4H",
+                                        entry=(trade or {}).get("entry"),
+                                        stop=(trade or {}).get("stop"),
+                                        target1=(trade or {}).get("target1"),
+                                        market_type="forex",
+                                        tier=tier_arg,
+                                        source="admin_/forex",
+                                        skip_burst_queue=True,
+                                    )
+                                    if not ok:
+                                        send(chat_id, f"Publish suppressed: {reason}")
+                                    else:
+                                        send(chat_id,
+                                            f"✅ <b>Forex Idea #{idea_id}</b> posted to Pro channel.\n"
+                                            f"Pair: {pair_arg} | Tier: {tier_arg.upper()}\n"
+                                            f"Use /closetrade {idea_id} [result] when it closes.")
                                 else:
                                     send(chat_id, f"⚠️ No quality {tier_arg} setup for {pair_arg} right now.")
                             except Exception as fe:
@@ -1269,14 +1350,30 @@ def run():
                             try:
                                 msg, trade, idea_id = generate_trade_idea(coin_arg, tier_arg)
                                 if msg and idea_id:
-                                    # Post to Pro channel
-                                    post_to_pro_channel(msg)
-                                    send(chat_id,
-                                        f"✅ <b>Trade Idea #{idea_id}</b> generated and posted to Pro channel.\n\n"
-                                        f"Coin: {coin_arg} | Tier: {tier_arg.upper()}\n"
-                                        f"Entry: {trade.get('entry','—')} | Stop: {trade.get('stop','—')} | T1: {trade.get('target1','—')}\n\n"
-                                        f"Use /closetrade {idea_id} [hit_t1|hit_t2|stopped|cancelled] when trade closes."
+                                    from market_pulse.publication_gate import publish_canonical_trade
+                                    ok, reason = publish_canonical_trade(
+                                        msg=msg,
+                                        idea_id=idea_id,
+                                        symbol=coin_arg,
+                                        direction=(trade or {}).get("direction") or "long",
+                                        timeframe=(trade or {}).get("timeframe") or "1H",
+                                        entry=(trade or {}).get("entry"),
+                                        stop=(trade or {}).get("stop"),
+                                        target1=(trade or {}).get("target1"),
+                                        market_type="crypto",
+                                        tier=tier_arg,
+                                        source="admin_/trade",
+                                        skip_burst_queue=True,
                                     )
+                                    if not ok:
+                                        send(chat_id, f"Publish suppressed: {reason}")
+                                    else:
+                                        send(chat_id,
+                                            f"✅ <b>Trade Idea #{idea_id}</b> generated and posted to Pro channel.\n\n"
+                                            f"Coin: {coin_arg} | Tier: {tier_arg.upper()}\n"
+                                            f"Entry: {(trade or {}).get('entry','—')} | Stop: {(trade or {}).get('stop','—')} | T1: {(trade or {}).get('target1','—')}\n\n"
+                                            f"Use /closetrade {idea_id} [hit_t1|hit_t2|stopped|cancelled] when trade closes."
+                                        )
                                 else:
                                     send(chat_id,
                                         f"⚠️ No quality {tier_arg} setup found for {coin_arg} right now.\n"

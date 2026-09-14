@@ -16,6 +16,7 @@ from market_pulse.config_runtime import (
     SHADOW_VERIFY_PRIVATE_ONLY,
     WAT_OFFSET,
     logger,
+    LEGACY_SHADOW,
 )
 from market_pulse.db import get_db
 from market_pulse.helpers import format_price, wat_now
@@ -273,6 +274,8 @@ def independent_step(
 
 def enroll_new_trades(limit: int = 30) -> int:
     """Enroll only trades with created_at >= shadow activation cutoff."""
+    if not LEGACY_SHADOW:
+        return 0
     if not SHADOW_VERIFY_ENABLED:
         return 0
     _ensure_shadow_schema()
@@ -371,10 +374,34 @@ def _normalize_result(r: str) -> str:
         return "EXPIRED"
     if "AMBIGUOUS" in r:
         return "AMBIGUOUS"
+    if r in ("OPEN", "ACTIVE", "ENTRY_NOT_REACHED", "STILL_OPEN", ""):
+        return r if r else ""
     return r
 
 
+def _results_compatible(mon: str, shadow: str) -> bool:
+    """True when monitor and shadow agree for trading purposes.
+
+    TP1 vs TP2 is progression (both targets hit path) — MATCH, not a fight.
+    STOP must equal STOP. EXPIRED must equal EXPIRED.
+    """
+    m = _normalize_result(mon)
+    s = _normalize_result(shadow)
+    if not m or m in ("OPEN", "ACTIVE", "ENTRY_NOT_REACHED", "STILL_OPEN"):
+        return False
+    if not s:
+        return False
+    if m == s:
+        return True
+    tp = {"TP1_HIT", "TP2_HIT"}
+    if m in tp and s in tp:
+        return True
+    return False
+
+
 def tick_shadow_verifications(limit: int = 40) -> None:
+    if not LEGACY_SHADOW:
+        return
     if not SHADOW_VERIFY_ENABLED:
         return
     _ensure_shadow_schema()
@@ -600,6 +627,8 @@ def _format_comparison(
 
 
 def run_shadow_cycle() -> None:
+    if not LEGACY_SHADOW:
+        return
     if not SHADOW_VERIFY_ENABLED:
         return
     try:
