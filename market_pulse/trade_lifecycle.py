@@ -279,7 +279,22 @@ def process_open_trade(c, row: tuple, now: datetime, now_s: str) -> Optional[str
                     idea_id,
                 ),
             )
-        if (last_notified or "") != new_state:
+        # Post-SL lockout: block same symbol+direction until cooldown + reclaim
+        if new_state in ("STOP_HIT", "BE_EXIT"):
+            try:
+                from market_pulse.setup_lockout import record_stop_lockout
+                record_stop_lockout(
+                    symbol=str(coin or ""),
+                    direction=str(direction or "long"),
+                    entry=entry,
+                    stop=stop,
+                    idea_id=int(idea_id) if idea_id else None,
+                )
+            except Exception as _le:
+                logger.debug("[LIFECYCLE] lockout record: %s", _le)
+
+        pub = (publication_status or "").upper()
+        if (last_notified or "") != new_state and pub == "PUBLISHED":
             emoji = {
                 "TP1_HIT": "🟢", "TP2_HIT": "🟢", "STOP_HIT": "🔴",
                 "BE_EXIT": "🟡", "EXPIRED": "⚪", "AMBIGUOUS": "⚪",
@@ -290,6 +305,11 @@ def process_open_trade(c, row: tuple, now: datetime, now_s: str) -> Optional[str
                 f"Entry {format_price(entry)} · SL {format_price(stop)}\n"
                 f"TP1 {format_price(t1) if t1 else '—'} · TP2 {format_price(t2) if t2 else '—'}\n"
                 f"Single lifecycle engine · NFA"
+            )
+        elif (last_notified or "") != new_state and pub != "PUBLISHED":
+            logger.debug(
+                "[LIFECYCLE] #%s %s terminal=%s (no DM — not PUBLISHED)",
+                idea_id, coin, new_state,
             )
         return new_state
 

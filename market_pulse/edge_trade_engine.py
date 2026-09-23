@@ -454,6 +454,14 @@ def save_trade_idea(coin, tier, trade, ai_raw=""):
         # Do not open a duplicate while an idea is still valid
         direction = trade.get("direction", "Long")
         try:
+            from market_pulse.setup_lockout import is_setup_blocked
+            _blocked, _why = is_setup_blocked(coin, direction)
+            if _blocked:
+                logger.info("[TRADE IDEAS] %s %s blocked by lockout: %s", coin, direction, _why)
+                return 0
+        except Exception as _le:
+            logger.debug("[TRADE IDEAS] lockout: %s", _le)
+        try:
             c.execute(
                 """
                 SELECT id, valid_until, entry, stop, target1 FROM trade_ideas
@@ -688,6 +696,27 @@ def generate_trade_idea(coin, tier="momentum"):
         price, _ = get_best_price(coin)
         if not price:
             return None, None, 0
+
+        # Post-SL lockout + open same-direction guard
+        try:
+            from market_pulse.setup_lockout import (
+                is_setup_blocked,
+                has_open_same_direction,
+            )
+            # Direction unknown until build; block if ANY open on coin, or long lockout
+            # (most stops were longs). Short lockout checked after direction known in save path.
+            if has_open_same_direction(coin, "long") or has_open_same_direction(coin, "short"):
+                logger.info("[TRADE] %s skip — open trade already exists", coin)
+                return None, None, 0
+            for _d in ("long", "short"):
+                blocked, why = is_setup_blocked(coin, _d, live_price=float(price))
+                if blocked and _d == "long":
+                    # Primary: block long re-entry after long SL (dominant failure mode)
+                    logger.info("[TRADE] %s skip — lockout %s %s", coin, _d, why)
+                    return None, None, 0
+        except Exception as _lx:
+            logger.debug("[TRADE] lockout check: %s", _lx)
+
         sd      = get_secondary_coin(coin)
         fg_data = get_fear_greed()
         fg_val  = fg_data[0]["value"] if fg_data else "50"

@@ -472,6 +472,25 @@ def generate_forex_trade_idea(pair_key, tier="momentum"):
     if pair_key in NON_TRADEABLE_FOREX_PAIRS or str(pair_key).upper().endswith("/NGN"):
         logger.info("[FOREX] %s is not tradeable (local context only) — skip setup", pair_key)
         return None, None, None
+
+    # Post-SL lockout + open-trade guard (same direction)
+    try:
+        from market_pulse.setup_lockout import (
+            is_setup_blocked,
+            has_open_same_direction,
+        )
+        # Default FX bias is Buy / long unless generator later flips
+        _dir = "long"
+        if has_open_same_direction(pair_key, _dir):
+            logger.info("[FOREX ENGINE] %s skip — open %s already exists", pair_key, _dir)
+            return None, None, None
+        blocked, why = is_setup_blocked(pair_key, _dir)
+        if blocked:
+            logger.info("[FOREX ENGINE] %s skip — lockout %s", pair_key, why)
+            return None, None, None
+    except Exception as _lx:
+        logger.debug("[FOREX ENGINE] lockout check: %s", _lx)
+
     """Fetch rate → news gate → programmatic levels preferred → validate → save."""
     try:
         if pair_key not in FOREX_PAIRS:
@@ -560,6 +579,36 @@ def generate_forex_trade_idea(pair_key, tier="momentum"):
             risk = (entry - stop) if is_buy else (stop - entry)
             reward = (t1 - entry) if is_buy else (entry - t1)
             rr = (reward / risk) if risk else 0
+            # Anti-spam: do not open another identical/near-identical FX idea
+            try:
+                c.execute(
+                    """
+                    SELECT id, entry, stop FROM trade_ideas
+                    WHERE status='open' AND UPPER(coin)=UPPER(%s)
+                    ORDER BY id DESC LIMIT 15
+                    """,
+                    (pair_key,),
+                )
+                for row in c.fetchall() or []:
+                    eid, e2, s2 = row
+                    try:
+                        e2f, s2f = float(e2), float(s2)
+                    except Exception:
+                        continue
+                    if e2f <= 0:
+                        continue
+                    if abs(e2f - entry) / e2f <= 0.002 and abs(s2f - stop) / max(abs(s2f), 1e-9) <= 0.05:
+                        logger.info(
+                            "[FOREX ENGINE] skip duplicate open #%s for %s (entry~%s)",
+                            eid, pair_key, e2,
+                        )
+                        idea_id = int(eid)
+                        msg = build_forex_trade_message(
+                            pair_key, rate, tier, trade, idea_id, source_str=source or ""
+                        )
+                        return msg, trade, idea_id
+            except Exception as de:
+                logger.debug("[FOREX ENGINE] dedupe check: %s", de)
             c.execute(
                 """INSERT INTO trade_ideas
                    (coin, tier, direction, timeframe, entry, stop, target1, target2,
