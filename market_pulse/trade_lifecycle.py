@@ -299,11 +299,15 @@ def process_open_trade(c, row: tuple, now: datetime, now_s: str) -> Optional[str
                 "TP1_HIT": "🟢", "TP2_HIT": "🟢", "STOP_HIT": "🔴",
                 "BE_EXIT": "🟡", "EXPIRED": "⚪", "AMBIGUOUS": "⚪",
             }.get(new_state, "•")
+            gen_s = str(created_at or "")[:16] if created_at else "—"
+            close_s = str(now_s or "")[:16]
             _notify_admins(
                 f"{emoji} LIFECYCLE #{idea_id} — {new_state}\n"
-                f"{coin} · {(direction or '').upper()}\n"
+                f"{coin} · {(direction or '').upper()} · {(tier or '')}\n"
                 f"Entry {format_price(entry)} · SL {format_price(stop)}\n"
                 f"TP1 {format_price(t1) if t1 else '—'} · TP2 {format_price(t2) if t2 else '—'}\n"
+                f"Generated: {gen_s} WAT\n"
+                f"Closed:    {close_s} WAT\n"
                 f"Single lifecycle engine · NFA"
             )
         elif (last_notified or "") != new_state and pub != "PUBLISHED":

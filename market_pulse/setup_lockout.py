@@ -1,13 +1,15 @@
 """
-Post-SL setup lockout — prevent immediate re-buy of the same thesis.
+Post-SL setup lockout — smart re-entry, not a dumb timer.
 
-After STOP_HIT on a direction:
-  - Block same symbol + same direction for LOCKOUT_HOURS
-  - Require price to reclaim past the failed entry (long: price > entry;
-    short: price < entry) before allowing a new setup
-  - New setup must recalculate levels (always true if generator runs fresh)
+After STOP_HIT on symbol+direction:
+  1) Minimum pause (default 1h) — no instant re-entry of the same idea
+  2) After that: allow only if price RECLAIMS past failed entry
+     - long stop → price must trade back above failed entry
+     - short stop → price must trade back below failed entry
+  3) Max age (default 24h) — lockout expires so the bot is not frozen forever
+  4) Unpublished open zombies do not block new setups (only PUBLISHED opens)
 
-Does not change R:R math. Used by forex + crypto generators + lifecycle.
+Used by forex + crypto generators + lifecycle.
 """
 
 from __future__ import annotations
@@ -19,8 +21,11 @@ from typing import Any, Optional, Tuple
 from market_pulse.config_runtime import logger
 from market_pulse.db import get_db
 
-LOCKOUT_HOURS = float(os.environ.get("SETUP_LOCKOUT_HOURS", "6"))
-RECLAIM_BUFFER_PCT = float(os.environ.get("SETUP_RECLAIM_BUFFER_PCT", "0.05"))  # 0.05% past entry
+# Min pause after SL before any re-check (hours)
+MIN_WAIT_HOURS = float(os.environ.get("SETUP_LOCKOUT_MIN_HOURS", "1"))
+# Max time a lockout can block without reclaim (hours)
+MAX_LOCKOUT_HOURS = float(os.environ.get("SETUP_LOCKOUT_HOURS", "24"))
+RECLAIM_BUFFER_PCT = float(os.environ.get("SETUP_RECLAIM_BUFFER_PCT", "0.05"))
 
 
 def _norm_symbol(sym: str) -> str:
@@ -67,7 +72,7 @@ def record_stop_lockout(
     idea_id: Optional[int] = None,
     hours: Optional[float] = None,
 ) -> None:
-    """Call when a trade hits STOP — blocks same-direction re-entry."""
+    """Call when a trade hits STOP — blocks same-direction re-entry until confirm."""
     sym = _norm_symbol(symbol)
     direction = _norm_dir(direction)
     if not sym:
@@ -82,8 +87,9 @@ def record_stop_lockout(
         stop_f = None
 
     now = time.time()
-    hrs = float(hours if hours is not None else LOCKOUT_HOURS)
-    unlock = now + max(0.5, hrs) * 3600.0
+    # unlock_after = earliest time we even look at reclaim (min wait)
+    min_h = float(hours if hours is not None else MIN_WAIT_HOURS)
+    unlock = now + max(0.25, min_h) * 3600.0
 
     db = None
     try:
@@ -116,8 +122,8 @@ def record_stop_lockout(
         )
         db.commit()
         logger.info(
-            "[LOCKOUT] %s %s after STOP entry=%s unlock_in=%.1fh",
-            sym, direction, entry_f, hrs,
+            "[LOCKOUT] %s %s after STOP entry=%s min_wait=%.1fh max=%.1fh",
+            sym, direction, entry_f, min_h, MAX_LOCKOUT_HOURS,
         )
     except Exception as e:
         logger.warning("[LOCKOUT] record failed %s %s: %s", sym, direction, e)
@@ -163,7 +169,6 @@ def clear_lockout(symbol: str, direction: str) -> None:
 
 def _live_price(symbol: str) -> Optional[float]:
     sym = _norm_symbol(symbol)
-    # Forex pairs
     if "/" in sym:
         try:
             from market_pulse.forex_trade_engine import get_forex_rate
@@ -174,7 +179,10 @@ def _live_price(symbol: str) -> Optional[float]:
             pass
     try:
         from market_pulse.price_fetchers import get_best_price
-        p = get_best_price(sym.split("/")[0] if "/" in sym else sym)
+        coin = sym.split("/")[0] if "/" in sym else sym
+        p = get_best_price(coin)
+        if isinstance(p, (list, tuple)):
+            p = p[0]
         if p is not None:
             return float(p)
     except Exception:
@@ -190,7 +198,11 @@ def is_setup_blocked(
 ) -> Tuple[bool, str]:
     """
     Returns (blocked, reason).
-    Unblocks only when time elapsed AND price reclaimed past failed entry.
+
+    Logic:
+      - Before min wait → blocked
+      - After max lockout age → clear, allow
+      - Else require price reclaim past failed entry
     """
     sym = _norm_symbol(symbol)
     direction = _norm_dir(direction)
@@ -217,13 +229,20 @@ def is_setup_blocked(
 
         failed_entry, failed_stop, unlock_after, locked_at, idea_id = row
         now = time.time()
+        locked_at = float(locked_at or 0)
         unlock_after = float(unlock_after or 0)
 
+        # 1) Minimum pause
         if now < unlock_after:
             left = (unlock_after - now) / 3600.0
-            return True, f"POST_SL_COOLDOWN:{left:.1f}h"
+            return True, f"POST_SL_MIN_WAIT:{left:.1f}h"
 
-        # Time passed — require reclaim
+        # 2) Max age — do not freeze forever
+        if locked_at and (now - locked_at) >= MAX_LOCKOUT_HOURS * 3600.0:
+            clear_lockout(sym, direction)
+            logger.info("[LOCKOUT] expired max age %s %s", sym, direction)
+            return False, ""
+
         try:
             fe = float(failed_entry) if failed_entry is not None else None
         except Exception:
@@ -239,14 +258,12 @@ def is_setup_blocked(
 
         buf = abs(fe) * (RECLAIM_BUFFER_PCT / 100.0)
         if direction == "long":
-            # Must reclaim above failed entry
             if price < fe + buf:
                 return True, f"POST_SL_NEED_RECLAIM_ABOVE:{fe}"
         else:
             if price > fe - buf:
                 return True, f"POST_SL_NEED_RECLAIM_BELOW:{fe}"
 
-        # Reclaimed + time ok → clear and allow
         clear_lockout(sym, direction)
         logger.info(
             "[LOCKOUT] cleared %s %s — reclaimed price=%s entry_was=%s",
@@ -265,7 +282,10 @@ def is_setup_blocked(
 
 
 def has_open_same_direction(symbol: str, direction: str) -> bool:
-    """True if an open trade_ideas row exists for symbol+direction."""
+    """
+    Only PUBLISHED open trades block a new setup.
+    Zombie / research opens must not freeze the scanner.
+    """
     sym = _norm_symbol(symbol)
     direction = _norm_dir(direction)
     db = None
@@ -273,16 +293,33 @@ def has_open_same_direction(symbol: str, direction: str) -> bool:
         db = get_db()
         c = db.cursor()
         if direction == "long":
-            d_like = "%buy%"
-            d_like2 = "%long%"
+            d_like, d_like2 = "%buy%", "%long%"
         else:
-            d_like = "%sell%"
-            d_like2 = "%short%"
+            d_like, d_like2 = "%sell%", "%short%"
+        try:
+            c.execute(
+                """
+                SELECT id FROM trade_ideas
+                WHERE status='open'
+                  AND UPPER(REPLACE(coin,' ','')) = %s
+                  AND (direction ILIKE %s OR direction ILIKE %s)
+                  AND UPPER(COALESCE(publication_status,'')) = 'PUBLISHED'
+                LIMIT 1
+                """,
+                (sym, d_like, d_like2),
+            )
+            if c.fetchone():
+                return True
+        except Exception:
+            pass
         c.execute(
             """
             SELECT id FROM trade_ideas
-            WHERE status='open' AND UPPER(REPLACE(coin,' ','')) = %s
+            WHERE status='open'
+              AND UPPER(REPLACE(coin,' ','')) = %s
               AND (direction ILIKE %s OR direction ILIKE %s)
+              AND UPPER(COALESCE(result,'')) NOT IN
+                  ('STOP_HIT','TP1_HIT','TP2_HIT','EXPIRED','AMBIGUOUS','BE_EXIT')
             LIMIT 1
             """,
             (sym, d_like, d_like2),

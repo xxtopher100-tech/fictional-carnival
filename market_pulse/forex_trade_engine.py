@@ -180,8 +180,8 @@ def _programmatic_forex_levels(pair_key, rate, tier):
     if stop_dist <= 0:
         return None
 
-    # Direction: for NGN pairs, mild bias from P2P mid vs USD/NGN if available
-    direction = "Buy"
+    # Direction from market structure (not always Buy)
+    direction = f"Buy {pair['base']}"
     is_buy = True
     try:
         if "NGN" in pair_key and pair_key != "USD/NGN":
@@ -191,7 +191,37 @@ def _programmatic_forex_levels(pair_key, rate, tier):
             else:
                 direction, is_buy = f"Buy {pair['base']}", True
         else:
-            direction, is_buy = f"Buy {pair['base']}", True
+            # EUR/USD, GBP/USD: use recent candle trend when available
+            is_buy = True
+            direction = f"Buy {pair['base']}"
+            try:
+                from market_pulse.candle_engine import get_candles
+                candles = get_candles(pair_key) or get_candles(pair["symbol"]) or []
+                if candles and len(candles) >= 12:
+                    closes = []
+                    for c in candles[-20:]:
+                        try:
+                            closes.append(float(c.get("close") or c.get("c") or 0))
+                        except Exception:
+                            pass
+                    closes = [x for x in closes if x > 0]
+                    if len(closes) >= 8:
+                        sma = sum(closes) / len(closes)
+                        last = closes[-1]
+                        # clear bias only — skip choppy (handled by returning None below)
+                        if last > sma * 1.0008:
+                            is_buy, direction = True, f"Buy {pair['base']}"
+                        elif last < sma * 0.9992:
+                            is_buy, direction = False, f"Sell {pair['base']}"
+                        else:
+                            # No clear trend — do not force a buy into chop
+                            logger.info(
+                                "[FOREX] %s no clear trend (last=%s sma=%s) — skip levels",
+                                pair_key, last, sma,
+                            )
+                            return None
+            except Exception as _te:
+                logger.debug("[FOREX] trend %s: %s", pair_key, _te)
     except Exception:
         direction, is_buy = f"Buy {pair['base']}", True
 
@@ -473,23 +503,14 @@ def generate_forex_trade_idea(pair_key, tier="momentum"):
         logger.info("[FOREX] %s is not tradeable (local context only) — skip setup", pair_key)
         return None, None, None
 
-    # Post-SL lockout + open-trade guard (same direction)
+    # Open published trade guard (both directions) — detailed lockout after levels
     try:
-        from market_pulse.setup_lockout import (
-            is_setup_blocked,
-            has_open_same_direction,
-        )
-        # Default FX bias is Buy / long unless generator later flips
-        _dir = "long"
-        if has_open_same_direction(pair_key, _dir):
-            logger.info("[FOREX ENGINE] %s skip — open %s already exists", pair_key, _dir)
-            return None, None, None
-        blocked, why = is_setup_blocked(pair_key, _dir)
-        if blocked:
-            logger.info("[FOREX ENGINE] %s skip — lockout %s", pair_key, why)
+        from market_pulse.setup_lockout import has_open_same_direction
+        if has_open_same_direction(pair_key, "long") or has_open_same_direction(pair_key, "short"):
+            logger.info("[FOREX ENGINE] %s skip — published open trade exists", pair_key)
             return None, None, None
     except Exception as _lx:
-        logger.debug("[FOREX ENGINE] lockout check: %s", _lx)
+        logger.debug("[FOREX ENGINE] open check: %s", _lx)
 
     """Fetch rate → news gate → programmatic levels preferred → validate → save."""
     try:
@@ -565,6 +586,20 @@ def generate_forex_trade_idea(pair_key, tier="momentum"):
                 trade["ng_angle"],
                 fallback="Size small; confirm live P2P quotes before converting naira.",
             )
+
+        # Post-SL lockout for the actual direction we are about to save
+        try:
+            from market_pulse.setup_lockout import is_setup_blocked
+            _dcheck = "long" if (
+                "buy" in str(trade.get("direction", "")).lower()
+                or "long" in str(trade.get("direction", "")).lower()
+            ) else "short"
+            blocked, why = is_setup_blocked(pair_key, _dcheck)
+            if blocked:
+                logger.info("[FOREX ENGINE] %s %s skip — lockout %s", pair_key, _dcheck, why)
+                return None, None, None
+        except Exception as _lx2:
+            logger.debug("[FOREX ENGINE] lockout: %s", _lx2)
 
         idea_id = 0
         db = None

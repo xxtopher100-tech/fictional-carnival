@@ -826,7 +826,8 @@ def get_trade_history(limit=10, coin=None, tier=None):
         where = ("WHERE " + " AND ".join(filters)) if filters else ""
         params.append(limit)
         c.execute(
-            f"SELECT id, coin, tier, direction, timeframe, entry, target1, confidence, status, created_at "
+            f"SELECT id, coin, tier, direction, timeframe, entry, target1, confidence, status, created_at, "
+            f"COALESCE(result,''), COALESCE(closed_at,''), COALESCE(publication_status,'') "
             f"FROM trade_ideas {where} ORDER BY id DESC LIMIT %s", params
         )
         return c.fetchall()
@@ -837,6 +838,39 @@ def get_trade_history(limit=10, coin=None, tier=None):
         if db:
             try: db.close()
             except Exception: pass
+
+
+def get_open_trade_ideas(limit=30, published_only=False):
+    """Open bot setups with dates (admin /opentrades)."""
+    db = None
+    try:
+        db = get_db()
+        c = db.cursor()
+        extra = ""
+        if published_only:
+            extra = " AND UPPER(COALESCE(publication_status,'')) = 'PUBLISHED'"
+        c.execute(
+            f"""
+            SELECT id, coin, tier, direction, timeframe, entry, stop, target1,
+                   created_at, COALESCE(valid_until,''), COALESCE(publication_status,''),
+                   COALESCE(lifecycle_status,''), COALESCE(result,'')
+            FROM trade_ideas
+            WHERE status='open'{extra}
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return c.fetchall()
+    except Exception as e:
+        logger.error(f"[OPEN TRADES] {e}")
+        return []
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 def close_trade_idea(idea_id, result):

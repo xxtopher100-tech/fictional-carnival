@@ -1385,7 +1385,39 @@ def run():
                                 send(chat_id, f"❌ Error: {te}")
                             continue
 
+                        # ── OPEN SETUPS (bot trade_ideas) ─────────────────────────────
+                        if text.startswith("/opentrades") or text.startswith("/openideas"):
+                            try:
+                                rows = get_open_trade_ideas(limit=25, published_only=False)
+                            except Exception as e:
+                                send(chat_id, f"Open trades error: {e}")
+                                continue
+                            if not rows:
+                                send(chat_id, "🟡 <b>Open setups</b>\n\nNone open right now.")
+                                continue
+                            lines = [
+                                "🟡 <b>Open setups</b> (trade_ideas)",
+                                f"<i>{len(rows)} shown · dates in WAT</i>",
+                                "",
+                            ]
+                            for row in rows:
+                                parts = list(row) + [""] * 13
+                                tid, coin, tier, direction, tf, entry, stop, t1, created, vu, pub, life, result = parts[:13]
+                                gen = str(created or "")[:16]
+                                valid = str(vu or "")[:16] if vu else "—"
+                                pub_s = pub or "—"
+                                lines.append(
+                                    f"#{tid} <b>{coin}</b> {(tier or '').upper()} {direction} {tf}\n"
+                                    f"   Entry {entry or '—'} · SL {stop or '—'} · T1 {t1 or '—'}\n"
+                                    f"   Generated: {gen} WAT\n"
+                                    f"   Valid until: {valid} · Pub: {pub_s} · Life: {life or '—'}"
+                                )
+                            lines += ["", "History: /trades · Close: /closetrade [ID] [result]"]
+                            send(chat_id, "\n".join(lines)[:4000])
+                            continue
+
                         # ── TRADE HISTORY ─────────────────────────────────────────────
+# ── TRADE HISTORY ─────────────────────────────────────────────
                         if text.startswith("/tradehistory") or text.startswith("/trades"):
                             parts = text.split()
                             coin_f = parts[1].upper() if len(parts) > 1 and parts[1].upper() in COINS else None
@@ -1396,13 +1428,25 @@ def run():
                             else:
                                 lines = ["📋 <b>Trade History</b>", f"<i>Showing last {len(rows)} ideas</i>", ""]
                                 for row in rows:
-                                    tid, coin, tier, direction, tf, entry, t1, conf, status, created = row
-                                    status_emoji = "✅" if status == "closed" else "🟡"
+                                    # supports old 10-col and new 13-col rows
+                                    if len(row) >= 13:
+                                        tid, coin, tier, direction, tf, entry, t1, conf, status, created, result, closed_at, pub = row[:13]
+                                    else:
+                                        tid, coin, tier, direction, tf, entry, t1, conf, status, created = row[:10]
+                                        result, closed_at, pub = "", "", ""
+                                    if status == "closed":
+                                        status_emoji = "🔴" if str(result).upper() in ("STOP_HIT", "STOPPED") else "✅"
+                                    else:
+                                        status_emoji = "🟡"
+                                    gen = str(created or "")[:16]
+                                    cl = str(closed_at or "")[:16] if closed_at else "—"
+                                    res = str(result or status or "—")
                                     lines.append(
-                                        f"{status_emoji} <b>#{tid}</b> {coin} {tier.upper()} {direction} {tf}\n"
-                                        f"   Entry: {entry or '—'} → T1: {t1 or '—'} | {conf} | {created[:10]}"
+                                        f"{status_emoji} <b>#{tid}</b> {coin} {(tier or '').upper()} {direction} {tf}\n"
+                                        f"   Entry: {entry or '—'} → T1: {t1 or '—'} | {res}\n"
+                                        f"   Generated: {gen} WAT · Closed: {cl}"
                                     )
-                                lines += ["", "Use /closetrade [ID] [result] to close an idea."]
+                                lines += ["", "Open only: /opentrades", "Close: /closetrade [ID] [result]"]
                                 send(chat_id, "\n".join(lines))
                             continue
 
