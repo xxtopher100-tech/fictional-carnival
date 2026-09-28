@@ -44,7 +44,7 @@ from market_pulse.macro_event_scanner import apply_macro_publication_gate
 
 # ── Markets (USDT/NGN is context-only — not listed here) ─────────────────────
 SCANNER_CRYPTO_COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "AVAX", "LINK", "DOGE"]
-SCANNER_FOREX_PAIRS = ["EUR/USD", "GBP/USD"]  # no NGN trade pairs — P2P/rates stay elsewhere
+SCANNER_FOREX_PAIRS = ["EUR/USD", "GBP/USD", "XAU/USD"]  # gold popular with NG retail
 SCANNER_TIER_ORDER = ["steady", "momentum", "edge"]
 
 # ── Configurable publish policy (env) ───────────────────────────────────────

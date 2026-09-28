@@ -74,10 +74,15 @@ FOREX_PAIRS = {
         "base": "GBP", "quote": "USD", "symbol": "$", "source": "fiat",
         "pip_size": 0.0001, "typical_spread": 0.0002, "asset": None,
     },
+    "XAU/USD": {
+        "description": "Gold vs US Dollar (Nigerian favourite)",
+        "base": "XAU", "quote": "USD", "symbol": "$", "source": "metal",
+        "pip_size": 0.01, "typical_spread": 0.35, "asset": None,
+    },
 }
 
 # Liquid pairs preferred for morning package / scanner
-MORNING_FOREX_PAIRS = ["USDT/NGN", "EUR/NGN", "GBP/NGN", "EUR/USD", "GBP/USD"]  # rates/context OK
+MORNING_FOREX_PAIRS = ["USDT/NGN", "EUR/NGN", "GBP/NGN", "EUR/USD", "GBP/USD", "XAU/USD"]  # rates/context OK
 
 # Pairs that must never become SAFE/NORMAL/EDGE trade setups
 NON_TRADEABLE_FOREX_PAIRS = frozenset({
@@ -141,6 +146,41 @@ def get_forex_rate(pair_key, use_cache=True):
                     bid, ask = rate - spread, rate + spread
                     source = f"Frankfurter · {wat_now().strftime('%H:%M')} WAT"
 
+        elif pair["source"] == "metal":
+            # Gold: Coinbase PAXG-USD (tokenized gold ≈ XAU/USD spot)
+            rate = None
+            try:
+                import requests as _req
+                r = _req.get(
+                    "https://api.coinbase.com/v2/prices/PAXG-USD/spot",
+                    timeout=8,
+                )
+                if r.status_code == 200:
+                    amt = float((r.json().get("data") or {}).get("amount") or 0)
+                    if amt > 0:
+                        rate = amt
+                        source = f"Coinbase PAXG · {wat_now().strftime('%H:%M')} WAT"
+            except Exception as _me:
+                logger.debug("[FOREX RATE] XAU coinbase: %s", _me)
+            if rate is None:
+                try:
+                    # Fallback: metals-api style public endpoint (best-effort)
+                    import requests as _req
+                    r = _req.get(
+                        "https://api.coinbase.com/v2/prices/XAU-USD/spot",
+                        timeout=8,
+                    )
+                    if r.status_code == 200:
+                        amt = float((r.json().get("data") or {}).get("amount") or 0)
+                        if amt > 0:
+                            rate = amt
+                            source = f"Coinbase XAU · {wat_now().strftime('%H:%M')} WAT"
+                except Exception:
+                    pass
+            if rate is not None:
+                spread = float(pair.get("typical_spread") or 0.35)
+                bid, ask = rate - spread, rate + spread
+
         elif pair["source"] == "derived":
             btc_usd, _ = get_best_price("BTC")
             rates = get_fiat_rates() or {}
@@ -191,7 +231,7 @@ def _programmatic_forex_levels(pair_key, rate, tier):
             else:
                 direction, is_buy = f"Buy {pair['base']}", True
         else:
-            # EUR/USD, GBP/USD: use recent candle trend when available
+            # EUR/USD, GBP/USD, XAU/USD: use recent candle trend when available
             is_buy = True
             direction = f"Buy {pair['base']}"
             try:

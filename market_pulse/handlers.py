@@ -37,7 +37,7 @@ from market_pulse.config_runtime import (
 from market_pulse.content_engine import build_admin_dashboard, build_weekly_educational_content, format_content_package_for_admin, generate_and_deliver_content_package, get_content_package_by_id, get_pending_content_packages, mark_package_status
 from market_pulse.db import get_db, init_db
 from market_pulse.derivatives_engine import derivatives_engine_status, start_derivatives_engine
-from market_pulse.edge_trade_engine import TRADE_TIERS, check_user_price_alerts, check_watchlist_alerts, close_trade_idea, generate_trade_idea, get_trade_history
+from market_pulse.edge_trade_engine import TRADE_TIERS, check_user_price_alerts, check_watchlist_alerts, close_trade_idea, generate_trade_idea, get_trade_history, get_open_trade_ideas
 from market_pulse.fear_greed import fg_emoji, get_fear_greed
 from market_pulse.forex_trade_engine import FOREX_PAIRS, generate_forex_trade_idea
 from market_pulse.edge_trade_engine import mark_trade_publication
@@ -1388,7 +1388,8 @@ def run():
                         # ── OPEN SETUPS (bot trade_ideas) ─────────────────────────────
                         if text.startswith("/opentrades") or text.startswith("/openideas"):
                             try:
-                                rows = get_open_trade_ideas(limit=25, published_only=False)
+                                from market_pulse.edge_trade_engine import get_open_trade_ideas as _get_open_ideas
+                                rows = _get_open_ideas(limit=25, published_only=False)
                             except Exception as e:
                                 send(chat_id, f"Open trades error: {e}")
                                 continue
